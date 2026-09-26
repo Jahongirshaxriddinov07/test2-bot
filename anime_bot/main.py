@@ -1,25 +1,19 @@
 """
-Test2 Bot — ishga tushirish nuqtasi.
-
-    python main.py
-
-Ishga tushirishdan oldin:
-    1. requirements.txt dagi paketlarni o'rnating: pip install -r requirements.txt
-    2. .env.example asosida .env fayl yarating va BOT_TOKEN, SUPER_ADMIN_IDS
-       qiymatlarini to'ldiring.
+Test2 Bot — Webhook va Aiohttp Server.
 """
 from __future__ import annotations
 import os
-from aiohttp import web
 import asyncio
 import logging
 import random
 from logging.handlers import RotatingFileHandler
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 import config
 from database import Database
@@ -38,7 +32,6 @@ def setup_logging() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         handlers=handlers,
     )
-    # Kutubxonalarning haddan tashqari batafsil loglarini kamaytiramiz
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 
@@ -74,8 +67,8 @@ async def daily_backup_job(db: Database) -> None:
 
 
 async def daily_random_announcement(bot: Bot, db: Database) -> None:
-    """19-band: har kuni tasodifiy anime e'lon qilinadi (agar MAIN_CHANNEL sozlangan bo'lsa)."""
-    from handlers.admin import _post_announcement  # aylanma import'dan qochish uchun shu yerda
+    """Har kuni tasodifiy anime e'lon qilinadi."""
+    from handlers.admin import _post_announcement
 
     while True:
         await asyncio.sleep(24 * 60 * 60)
@@ -92,16 +85,20 @@ async def daily_random_announcement(bot: Bot, db: Database) -> None:
             logger.exception("daily_random_announcement xatolik")
 
 
-async def main() -> None:
+def main() -> None:
     setup_logging()
 
     if not config.BOT_TOKEN:
-        raise SystemExit(
-            "BOT_TOKEN topilmadi. .env faylida BOT_TOKEN=... qiymatini kiriting."
-        )
+        raise SystemExit("BOT_TOKEN topilmadi. .env faylida BOT_TOKEN=... qiymatini kiriting.")
+
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not render_url:
+        raise SystemExit("RENDER_EXTERNAL_URL topilmadi.")
+
+    webhook_path = f"/webhook/{config.BOT_TOKEN}"
+    webhook_url = f"{render_url}{webhook_path}"
 
     db = Database(config.DB_PATH)
-    await db.connect()
 
     bot = Bot(
         token=config.BOT_TOKEN,
@@ -109,61 +106,42 @@ async def main() -> None:
     )
     dp = Dispatcher(storage=MemoryStorage())
 
-    # db obyektini barcha handlerlarga avtomatik uzatish
+    # db obyektini barcha handlerlarga uzatamiz
     dp["db"] = db
 
-    dp.include_router(admin.router)  # admin filtri o'zida bo'lgani uchun avval ulaymiz
+    dp.include_router(admin.router)
     dp.include_router(user.router)
 
-    dp.startup.register(lambda: logger.info("Bot ishga tushdi."))
-
-
-    background_tasks = [
-        asyncio.create_task(vip_expiry_watcher(bot, db)),
-        asyncio.create_task(daily_backup_job(db)),
-        asyncio.create_task(daily_random_announcement(bot, db)),
-    ]
-
-    webhook_path = "/webhook"
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-
-    if not render_url:
-        raise SystemExit("RENDER_EXTERNAL_URL topilmadi.")
-
-    webhook_url = f"{render_url}{webhook_path}"
-
-    async def handle_webhook(request: web.Request) -> web.Response:
-        try:
-            data = await request.json()
-            from aiogram.types import Update
-
-            update = Update.model_validate(
-                data,
-                context={"bot": bot}
-            )
-
-            await dp.feed_update(bot, update)
-            return web.Response(text="OK")
-
-        except Exception:
-            logger.exception("Webhook xatolik")
-            return web.Response(status=500, text="ERROR")
-
-    app = web.Application()
-    app.router.add_post(webhook_path, handle_webhook)
+    background_tasks = []
 
     async def on_startup(app: web.Application) -> None:
-        await bot.set_webhook(webhook_url)
+        await db.connect()
+        await bot.set_webhook(webhook_url, drop_pending_updates=True)
         logger.info("Webhook o'rnatildi: %s", webhook_url)
 
-    async def on_cleanup(app: web.Application) -> None:
-        await bot.delete_webhook()
+        # Orqa fondagi (background) vazifalarni ishga tushiramiz
+        background_tasks.extend([
+            asyncio.create_task(vip_expiry_watcher(bot, db)),
+            asyncio.create_task(daily_backup_job(db)),
+            asyncio.create_task(daily_random_announcement(bot, db)),
+        ])
 
+    async def on_cleanup(app: web.Application) -> None:
         for task in background_tasks:
             task.cancel()
-
+        await bot.delete_webhook()
         await db.close()
         await bot.session.close()
+
+    app = web.Application()
+
+    # Aiogram tayyor webhook ishlovchisi
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path=webhook_path)
+    setup_application(app, dp, bot=bot)
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
@@ -175,10 +153,10 @@ async def main() -> None:
         host="0.0.0.0",
         port=port
     )
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot to'xtatildi.")
-
-
