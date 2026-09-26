@@ -1,361 +1,713 @@
-"""Test2 Bot — barcha klaviaturalar (reply va inline) shu yerda to'plangan."""
+"""
+Test2 Bot — SQLite ma'lumotlar bazasi qatlami.
+
+Barcha DB operatsiyalari shu faylda to'plangan, handlerlar bevosita SQL
+yozmaydi — shu orqali bazaga oid mantiqni bir joyda ushlab turamiz va
+kelajakda (masalan PostgreSQL'ga) ko'chirishni osonlashtiramiz.
+"""
 from __future__ import annotations
 
-import math
+import datetime
+import logging
+import os
+import shutil
+from typing import Any, Optional
 
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+import aiosqlite
 
 import config
 
-# ---------------------------------------------------------------------- #
-# Reply (asosiy menyu) klaviaturalar
-# ---------------------------------------------------------------------- #
+logger = logging.getLogger("anime_bot.db")
 
-def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="🔎 Anime qidirish")],
-        [KeyboardButton(text="📚 Katalog"), KeyboardButton(text="🆕 Yangi animelar")],
-        [KeyboardButton(text="🔥 Mashhur animelar"), KeyboardButton(text="❤️ Sevimlilar")],
-        [KeyboardButton(text="📚 Ko'rish tarixi"), KeyboardButton(text="🎭 Janrlar")],
-        [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🆘 Yordam")],
-    ]
-    if is_admin:
-        rows.append([KeyboardButton(text="⚙️ Admin panel")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id   INTEGER UNIQUE NOT NULL,
+    full_name     TEXT,
+    username      TEXT,
+    is_admin      INTEGER NOT NULL DEFAULT 0,
+    vip_until     TEXT,              -- ISO datetime yoki NULL
+    balance       INTEGER NOT NULL DEFAULT 0,
+    joined_at     TEXT NOT NULL
+);
 
+CREATE TABLE IF NOT EXISTS genres (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    emoji    TEXT NOT NULL,
+    name     TEXT NOT NULL UNIQUE,
+    is_vip   INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
 
-def admin_back_to_user_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="👤 Foydalanuvchi paneliga qaytish")]],
-        resize_keyboard=True,
-    )
+CREATE TABLE IF NOT EXISTS anime (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    anime_code   TEXT UNIQUE NOT NULL,     -- foydalanuvchiga ko'rinadigan ID
+    title        TEXT NOT NULL,
+    description  TEXT,
+    poster_file_id TEXT,
+    is_vip       INTEGER NOT NULL DEFAULT 0,
+    is_published INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL
+);
 
+CREATE TABLE IF NOT EXISTS anime_genres (
+    anime_id  INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+    genre_id  INTEGER NOT NULL REFERENCES genres(id) ON DELETE CASCADE,
+    PRIMARY KEY (anime_id, genre_id)
+);
 
-def cancel_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
-        resize_keyboard=True,
-    )
+CREATE TABLE IF NOT EXISTS episodes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    anime_id       INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+    episode_number INTEGER NOT NULL,
+    video_file_id  TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    UNIQUE (anime_id, episode_number)
+);
 
+CREATE TABLE IF NOT EXISTS ratings (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    anime_id  INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    score     INTEGER NOT NULL CHECK (score BETWEEN 1 AND 10),
+    rated_at  TEXT NOT NULL,
+    UNIQUE (anime_id, user_id)
+);
 
-# ---------------------------------------------------------------------- #
-# Qidiruv
-# ---------------------------------------------------------------------- #
+CREATE TABLE IF NOT EXISTS favorites (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    anime_id  INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+    added_at  TEXT NOT NULL,
+    UNIQUE (user_id, anime_id)
+);
 
-def search_menu() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="🔤 Nom bo'yicha", callback_data="search:title")
-    b.button(text="🆔 Anime ID bo'yicha", callback_data="search:code")
-    b.button(text="⭐ Eng yuqori baholangan 10 ta", callback_data="search:top10")
-    b.adjust(1)
-    return b.as_markup()
+CREATE TABLE IF NOT EXISTS watch_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    anime_id    INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+    episode_id  INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
+    watched_at  TEXT NOT NULL
+);
 
+CREATE TABLE IF NOT EXISTS vip_purchases (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    months         INTEGER NOT NULL,
+    price          INTEGER NOT NULL,
+    source         TEXT NOT NULL,     -- 'payment' | 'admin_grant'
+    approved_by    INTEGER,           -- admin telegram_id
+    purchased_at   TEXT NOT NULL
+);
 
-# ---------------------------------------------------------------------- #
-# Janrlar
-# ---------------------------------------------------------------------- #
+CREATE TABLE IF NOT EXISTS pending_payments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    months            INTEGER NOT NULL,
+    price             INTEGER NOT NULL,
+    screenshot_file_id TEXT,
+    status            TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
+    created_at        TEXT NOT NULL,
+    resolved_at       TEXT,
+    resolved_by       INTEGER
+);
 
-def genres_menu(genres, selected_ids: set[int] | None = None, for_admin_add: bool = False) -> InlineKeyboardMarkup:
-    """
-    genres — Database.list_genres() natijasi (VIP janrlar avval keladi).
-    selected_ids — anime qo'shishda tanlangan janrlarni belgilash uchun.
-    """
-    selected_ids = selected_ids or set()
-    b = InlineKeyboardBuilder()
-    for g in genres:
-        mark = "✅ " if g["id"] in selected_ids else ""
-        prefix = "search_genre" if not for_admin_add else "pick_genre"
-        b.button(text=f"{mark}{g.get('emoji', '')} {g['name']}", callback_data=f"{prefix}:{g['id']}")
-    
-    b.adjust(2)  # Janrlarni 2 ustun qilib joylaymiz
-    
-    if for_admin_add:
-        b.row(InlineKeyboardButton(text="✅ Tayyor", callback_data="pick_genre:done"))
-        
-    return b.as_markup()
+CREATE TABLE IF NOT EXISTS required_channels (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     TEXT NOT NULL UNIQUE,   -- @username yoki -100...
+    title       TEXT
+);
 
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+);
 
-# ---------------------------------------------------------------------- #
-# Anime kartasi / ro'yxatlar
-# ---------------------------------------------------------------------- #
+CREATE TABLE IF NOT EXISTS broadcasts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_type   TEXT NOT NULL,      -- 'text' | 'copy' (forward/copy of a message)
+    payload        TEXT NOT NULL,      -- JSON: matn yoki source chat/message id
+    status         TEXT NOT NULL DEFAULT 'running',  -- running|paused|done|cancelled
+    total_count    INTEGER NOT NULL DEFAULT 0,
+    sent_count     INTEGER NOT NULL DEFAULT 0,
+    failed_count   INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    created_by     INTEGER NOT NULL
+);
 
-def anime_list_keyboard(anime_rows, page: int, total_pages: int, list_kind: str) -> InlineKeyboardMarkup:
-    """list_kind: 'new' | 'popular' | 'genre:<id>' | 'favorites' | 'history' | 'search'"""
-    b = InlineKeyboardBuilder()
-    for a in anime_rows:
-        b.button(text=f"{a['title']} (ID: {a['anime_code']})", callback_data=f"anime:{a['id']}")
-    b.adjust(1)
-    
-    if total_pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"list:{list_kind}:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-        if page < total_pages - 1:
-            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"list:{list_kind}:{page+1}"))
-        b.row(*nav)
-        
-    return b.as_markup()
-
-
-def anime_detail_keyboard(anime_id: int, is_favorite: bool, has_rated: bool) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="▶️ Qismlarni ko'rish", callback_data=f"episodes:{anime_id}:0")
-    fav_text = "💔 Sevimlilardan olib tashlash" if is_favorite else "❤️ Sevimlilarga qo'shish"
-    b.button(text=fav_text, callback_data=f"fav:{anime_id}")
-    if not has_rated:
-        b.button(text="⭐ Baholash", callback_data=f"rate_open:{anime_id}")
-    b.adjust(1)
-    return b.as_markup()
-
-
-def rating_keyboard(anime_id: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for i in range(1, 11):
-        b.button(text=f"{i}⭐", callback_data=f"rate:{anime_id}:{i}")
-    b.adjust(5, 5)
-    return b.as_markup()
-
-
-def episodes_keyboard(anime_id: int, episodes, page: int, total_episodes: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for ep in episodes:
-        b.button(text=str(ep["episode_number"]), callback_data=f"watch:{ep['id']}")
-    
-    cols = getattr(config, 'EPISODE_BUTTONS_COLUMNS', 5)
-    b.adjust(cols)
-
-    per_page = getattr(config, 'EPISODES_PER_PAGE', 10)
-    total_pages = max(1, math.ceil(total_episodes / per_page))
-    
-    if total_pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"episodes:{anime_id}:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-        if page < total_pages - 1:
-            nav.append(InlineKeyboardButton(text="🔜", callback_data=f"episodes:{anime_id}:{page+1}"))
-        b.row(*nav)
-        
-    b.row(InlineKeyboardButton(text="⬅️ Anime sahifasiga", callback_data=f"anime:{anime_id}"))
-    return b.as_markup()
+CREATE INDEX IF NOT EXISTS idx_episodes_anime ON episodes(anime_id);
+CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
+CREATE INDEX IF NOT EXISTS idx_history_user ON watch_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_anime_genres_anime ON anime_genres(anime_id);
+CREATE INDEX IF NOT EXISTS idx_anime_genres_genre ON anime_genres(genre_id);
+"""
 
 
-# ---------------------------------------------------------------------- #
-# VIP
-# ---------------------------------------------------------------------- #
-
-def vip_menu(prices: dict[int, str]) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text=f"1 oylik — {prices.get(1, '?')} so'm", callback_data="vip_buy:1")
-    b.button(text=f"2 oylik — {prices.get(2, '?')} so'm", callback_data="vip_buy:2")
-    b.button(text=f"3 oylik — {prices.get(3, '?')} so'm", callback_data="vip_buy:3")
-    b.adjust(1)
-    return b.as_markup()
+def _now() -> str:
+    return datetime.datetime.utcnow().isoformat(timespec="seconds")
 
 
-def vip_payment_confirm_keyboard(payment_id: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Tasdiqlash", callback_data=f"pay_approve:{payment_id}")
-    b.button(text="❌ Rad etish", callback_data=f"pay_reject:{payment_id}")
-    b.adjust(2)
-    return b.as_markup()
+class Database:
+    """Butun bot davomida ishlatiladigan yagona ulanish (WAL rejimida)."""
 
+    def __init__(self, path: str = config.DB_PATH):
+        self.path = path
+        self.conn: Optional[aiosqlite.Connection] = None
 
-def grant_vip_keyboard(user_telegram_id: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="💎 1 oylik VIP", callback_data=f"grant_vip:{user_telegram_id}:1")
-    b.button(text="💎 2 oylik VIP", callback_data=f"grant_vip:{user_telegram_id}:2")
-    b.button(text="💎 3 oylik VIP", callback_data=f"grant_vip:{user_telegram_id}:3")
-    b.adjust(1)
-    return b.as_markup()
+    # ------------------------------------------------------------------ #
+    # Ulanish / sozlash
+    # ------------------------------------------------------------------ #
+    async def connect(self) -> None:
+        self.conn = await aiosqlite.connect(self.path)
+        self.conn.row_factory = aiosqlite.Row
+        await self.conn.execute("PRAGMA journal_mode=WAL;")
+        await self.conn.execute("PRAGMA foreign_keys=ON;")
+        await self.conn.executescript(SCHEMA)
+        await self.conn.commit()
+        await self._seed_defaults()
+        logger.info("Baza ulandi: %s", self.path)
 
+    async def close(self) -> None:
+        if self.conn:
+            await self.conn.close()
 
-# ---------------------------------------------------------------------- #
-# Majburiy obuna
-# ---------------------------------------------------------------------- #
+    async def _seed_defaults(self) -> None:
+        # Sozlamalar
+        for key, value in config.DEFAULT_SETTINGS.items():
+            await self.conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        # Janrlar (faqat jadval bo'sh bo'lsa)
+        cur = await self.conn.execute("SELECT COUNT(*) FROM genres")
+        (count,) = await cur.fetchone()
+        if count == 0:
+            order = 0
+            for emoji, name in config.NORMAL_GENRES:
+                await self.conn.execute(
+                    "INSERT INTO genres (emoji, name, is_vip, sort_order) VALUES (?,?,0,?)",
+                    (emoji, name, order),
+                )
+                order += 1
+            for emoji, name in config.VIP_GENRES:
+                await self.conn.execute(
+                    "INSERT INTO genres (emoji, name, is_vip, sort_order) VALUES (?,?,1,?)",
+                    (emoji, name, order),
+                )
+                order += 1
+        # Super adminlar
+        for tg_id in config.SUPER_ADMIN_IDS:
+            existing = await self.get_user(tg_id)
+            if existing is None:
+                await self.create_user(tg_id, full_name="Admin", username=None)
+            await self.conn.execute(
+                "UPDATE users SET is_admin = 1 WHERE telegram_id = ?", (tg_id,)
+            )
+        await self.conn.commit()
 
-def subscribe_keyboard(channels) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for ch in channels:
-        link = str(ch["chat_id"])
-        if not link.startswith("http"):
-            uname = link.lstrip("@")
-            link = f"https://t.me/{uname}"
-        b.button(text=f"📢 {ch.get('title') or ch['chat_id']}", url=link)
-    b.adjust(1)
-    b.row(InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subs"))
-    return b.as_markup()
+    async def backup(self) -> str:
+        os.makedirs(config.BACKUP_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = os.path.join(config.BACKUP_DIR, f"anime_{stamp}.db")
+        await self.conn.commit()
+        shutil.copyfile(self.path, dest)
+        logger.info("Backup yaratildi: %s", dest)
+        return dest
 
+    # ------------------------------------------------------------------ #
+    # Settings (key-value)
+    # ------------------------------------------------------------------ #
+    async def get_setting(self, key: str, default: str = "") -> str:
+        cur = await self.conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row and row["value"] is not None else default
 
-# ---------------------------------------------------------------------- #
-# Profil
-# ---------------------------------------------------------------------- #
+    async def set_setting(self, key: str, value: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        await self.conn.commit()
 
-def profile_keyboard() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="💎 VIP olish", callback_data="vip_open")
-    b.adjust(1)
-    return b.as_markup()
+    # ------------------------------------------------------------------ #
+    # Users
+    # ------------------------------------------------------------------ #
+    async def create_user(
+        self, telegram_id: int, full_name: str, username: Optional[str]
+    ) -> aiosqlite.Row:
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO users (telegram_id, full_name, username, joined_at) "
+            "VALUES (?,?,?,?)",
+            (telegram_id, full_name, username, _now()),
+        )
+        await self.conn.commit()
+        return await self.get_user(telegram_id)
 
+    async def get_user(self, telegram_id: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT * FROM users WHERE telegram_id=?", (telegram_id,)
+        )
+        return await cur.fetchone()
 
-# ---------------------------------------------------------------------- #
-# Admin panel
-# ---------------------------------------------------------------------- #
+    async def get_user_by_pk(self, user_pk: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM users WHERE id=?", (user_pk,))
+        return await cur.fetchone()
 
-def admin_panel_menu() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="➕ Anime qo'shish", callback_data="adm:add_anime")
-    b.button(text="🎬 Animelar ro'yxati", callback_data="adm:anime_list:0")
-    b.button(text="👥 Foydalanuvchilar", callback_data="adm:users:0")
-    b.button(text="📊 Statistika", callback_data="adm:stats")
-    b.button(text="📢 Xabar yuborish (Broadcast)", callback_data="adm:broadcast")
-    b.button(text="📢 Majburiy kanallar", callback_data="adm:channels")
-    b.button(text="💰 VIP narxlari", callback_data="adm:vip_prices")
-    b.button(text="💳 To'lov ma'lumotlari", callback_data="adm:payment_info")
-    b.button(text="🖼 /start rasm/matn", callback_data="adm:start_settings")
-    b.button(text="🆘 Yordam matni", callback_data="adm:help_settings")
-    b.button(text="💾 Zaxira nusxa (Backup)", callback_data="adm:backup")
-    b.adjust(1)
-    return b.as_markup()
+    async def touch_user(self, telegram_id: int, full_name: str, username: Optional[str]) -> None:
+        """Har safar /start bosilganda ism/username yangilanadi."""
+        await self.conn.execute(
+            "UPDATE users SET full_name=?, username=? WHERE telegram_id=?",
+            (full_name, username, telegram_id),
+        )
+        await self.conn.commit()
 
+    async def is_admin(self, telegram_id: int) -> bool:
+        user = await self.get_user(telegram_id)
+        return bool(user and user["is_admin"])
 
-def admin_back_button(target: str = "adm:panel") -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ Orqaga", callback_data=target)
-    return b.as_markup()
+    async def set_admin(self, telegram_id: int, value: bool) -> None:
+        await self.conn.execute(
+            "UPDATE users SET is_admin=? WHERE telegram_id=?", (1 if value else 0, telegram_id)
+        )
+        await self.conn.commit()
 
+    async def is_vip(self, telegram_id: int) -> bool:
+        user = await self.get_user(telegram_id)
+        if not user or not user["vip_until"]:
+            return False
+        return datetime.datetime.fromisoformat(user["vip_until"]) > datetime.datetime.utcnow()
 
-def vip_prices_menu() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✏️ 1 oylik narxni o'zgartirish", callback_data="adm:set_price:1")
-    b.button(text="✏️ 2 oylik narxni o'zgartirish", callback_data="adm:set_price:2")
-    b.button(text="✏️ 3 oylik narxni o'zgartirish", callback_data="adm:set_price:3")
-    b.button(text="⬅️ Orqaga", callback_data="adm:panel")
-    b.adjust(1)
-    return b.as_markup()
+    async def grant_vip(self, telegram_id: int, months: int, price: int, source: str,
+                         approved_by: Optional[int] = None) -> datetime.datetime:
+        """VIP muddatini uzaytiradi (eski faol muddat bo'lsa unga qo'shiladi)."""
+        user = await self.get_user(telegram_id)
+        days = config.VIP_DAYS.get(months, 30 * months)
+        now = datetime.datetime.utcnow()
+        current_until = None
+        if user and user["vip_until"]:
+            current_until = datetime.datetime.fromisoformat(user["vip_until"])
+        base = current_until if (current_until and current_until > now) else now
+        new_until = base + datetime.timedelta(days=days)
+        await self.conn.execute(
+            "UPDATE users SET vip_until=? WHERE telegram_id=?",
+            (new_until.isoformat(timespec="seconds"), telegram_id),
+        )
+        await self.conn.execute(
+            "INSERT INTO vip_purchases (user_id, months, price, source, approved_by, purchased_at) "
+            "SELECT id, ?, ?, ?, ?, ? FROM users WHERE telegram_id=?",
+            (months, price, source, approved_by, _now(), telegram_id),
+        )
+        await self.conn.commit()
+        return new_until
 
+    async def expire_vips(self) -> list[int]:
+        """Muddati tugagan foydalanuvchilarni tozalaydi, telegram_id ro'yxatini qaytaradi."""
+        now = datetime.datetime.utcnow().isoformat(timespec="seconds")
+        cur = await self.conn.execute(
+            "SELECT telegram_id FROM users WHERE vip_until IS NOT NULL AND vip_until <= ?",
+            (now,),
+        )
+        rows = await cur.fetchall()
+        ids = [r["telegram_id"] for r in rows]
+        if ids:
+            await self.conn.execute(
+                "UPDATE users SET vip_until=NULL WHERE vip_until IS NOT NULL AND vip_until <= ?",
+                (now,),
+            )
+            await self.conn.commit()
+        return ids
 
-def payment_info_menu() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✏️ Karta raqamini o'zgartirish", callback_data="adm:set_card_number")
-    b.button(text="✏️ Karta egasini o'zgartirish", callback_data="adm:set_card_holder")
-    b.button(text="⬅️ Orqaga", callback_data="adm:panel")
-    b.adjust(1)
-    return b.as_markup()
+    async def count_users(self) -> int:
+        cur = await self.conn.execute("SELECT COUNT(*) FROM users")
+        (n,) = await cur.fetchone()
+        return n
 
+    async def count_vip_users(self) -> int:
+        now = datetime.datetime.utcnow().isoformat(timespec="seconds")
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM users WHERE vip_until IS NOT NULL AND vip_until > ?", (now,)
+        )
+        (n,) = await cur.fetchone()
+        return n
 
-def start_settings_menu() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✏️ Matnni o'zgartirish", callback_data="adm:set_start_text")
-    b.button(text="🖼 Rasmni o'zgartirish", callback_data="adm:set_start_photo")
-    b.button(text="⬅️ Orqaga", callback_data="adm:panel")
-    b.adjust(1)
-    return b.as_markup()
+    async def list_users(self, page: int, per_page: int = config.USERS_PER_PAGE) -> list[aiosqlite.Row]:
+        offset = page * per_page
+        cur = await self.conn.execute(
+            "SELECT * FROM users ORDER BY id DESC LIMIT ? OFFSET ?", (per_page, offset)
+        )
+        return await cur.fetchall()
 
+    async def all_telegram_ids(self) -> list[int]:
+        cur = await self.conn.execute("SELECT telegram_id FROM users")
+        rows = await cur.fetchall()
+        return [r["telegram_id"] for r in rows]
 
-def help_settings_menu() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✏️ Yordam matnini o'zgartirish", callback_data="adm:set_help_text")
-    b.button(text="✏️ Admin usernameni o'zgartirish", callback_data="adm:set_help_admin")
-    b.button(text="⬅️ Orqaga", callback_data="adm:panel")
-    b.adjust(1)
-    return b.as_markup()
+    # ------------------------------------------------------------------ #
+    # Genres
+    # ------------------------------------------------------------------ #
+    async def list_genres(self, vip_only: Optional[bool] = None) -> list[aiosqlite.Row]:
+        if vip_only is None:
+            cur = await self.conn.execute("SELECT * FROM genres ORDER BY is_vip DESC, sort_order")
+        else:
+            cur = await self.conn.execute(
+                "SELECT * FROM genres WHERE is_vip=? ORDER BY sort_order", (1 if vip_only else 0,)
+            )
+        return await cur.fetchall()
 
+    async def get_genre(self, genre_id: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM genres WHERE id=?", (genre_id,))
+        return await cur.fetchone()
 
-def channels_menu(channels) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for ch in channels:
-        b.button(text=f"❌ {ch.get('title') or ch['chat_id']}", callback_data=f"adm:del_channel:{ch['id']}")
-    b.button(text="➕ Kanal qo'shish", callback_data="adm:add_channel")
-    b.button(text="⬅️ Orqaga", callback_data="adm:panel")
-    b.adjust(1)
-    return b.as_markup()
+    # ------------------------------------------------------------------ #
+    # Anime
+    # ------------------------------------------------------------------ #
+    async def _next_anime_code(self) -> str:
+        cur = await self.conn.execute("SELECT COUNT(*) FROM anime")
+        (n,) = await cur.fetchone()
+        return str(n + 1)
 
+    async def create_anime(self, title: str, description: str, poster_file_id: Optional[str],
+                            genre_ids: list[int]) -> aiosqlite.Row:
+        code = await self._next_anime_code()
+        is_vip = 0
+        if genre_ids:
+            cur = await self.conn.execute(
+                f"SELECT COUNT(*) FROM genres WHERE id IN ({','.join('?' * len(genre_ids))}) AND is_vip=1",
+                genre_ids,
+            )
+            (vip_count,) = await cur.fetchone()
+            is_vip = 1 if vip_count > 0 else 0
+        cur = await self.conn.execute(
+            "INSERT INTO anime (anime_code, title, description, poster_file_id, is_vip, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (code, title, description, poster_file_id, is_vip, _now()),
+        )
+        anime_pk = cur.lastrowid
+        for gid in genre_ids:
+            await self.conn.execute(
+                "INSERT OR IGNORE INTO anime_genres (anime_id, genre_id) VALUES (?,?)",
+                (anime_pk, gid),
+            )
+        await self.conn.commit()
+        return await self.get_anime(anime_pk)
 
-def admin_anime_list_keyboard(anime_rows, page: int, total_pages: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for a in anime_rows:
-        b.button(text=f"{a['title']} (ID:{a['anime_code']})", callback_data=f"adm:anime:{a['id']}")
-    b.adjust(1)
-    
-    if total_pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:anime_list:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-        if page < total_pages - 1:
-            nav.append(InlineKeyboardButton(text="🔜", callback_data=f"adm:anime_list:{page+1}"))
-        b.row(*nav)
-        
-    b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm:panel"))
-    return b.as_markup()
+    async def update_anime_genres(self, anime_id: int, genre_ids: list[int]) -> None:
+        await self.conn.execute("DELETE FROM anime_genres WHERE anime_id=?", (anime_id,))
+        for gid in genre_ids:
+            await self.conn.execute(
+                "INSERT OR IGNORE INTO anime_genres (anime_id, genre_id) VALUES (?,?)",
+                (anime_id, gid),
+            )
+        is_vip = 0
+        if genre_ids:
+            cur = await self.conn.execute(
+                f"SELECT COUNT(*) FROM genres WHERE id IN ({','.join('?' * len(genre_ids))}) AND is_vip=1",
+                genre_ids,
+            )
+            (vip_count,) = await cur.fetchone()
+            is_vip = 1 if vip_count > 0 else 0
+        await self.conn.execute("UPDATE anime SET is_vip=? WHERE id=?", (is_vip, anime_id))
+        await self.conn.commit()
 
+    async def get_anime(self, anime_id: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM anime WHERE id=?", (anime_id,))
+        return await cur.fetchone()
 
-def admin_anime_detail_keyboard(anime_id: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="➕ Qism qo'shish (video yuborish)", callback_data=f"adm:add_episode:{anime_id}")
-    b.button(text="✏️ Nomi", callback_data=f"adm:edit_title:{anime_id}")
-    b.button(text="✏️ Tavsifi", callback_data=f"adm:edit_desc:{anime_id}")
-    b.button(text="🎭 Janrlarni o'zgartirish", callback_data=f"adm:edit_genres:{anime_id}")
-    b.button(text="📢 Kanalga e'lon qilish", callback_data=f"adm:announce:{anime_id}")
-    b.button(text="🗑 O'chirish", callback_data=f"adm:delete_anime_confirm:{anime_id}")
-    b.button(text="⬅️ Orqaga", callback_data="adm:anime_list:0")
-    b.adjust(1)
-    return b.as_markup()
+    async def get_anime_by_code(self, code: str) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM anime WHERE anime_code=?", (code,))
+        return await cur.fetchone()
 
+    async def get_anime_genres(self, anime_id: int) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT g.* FROM genres g JOIN anime_genres ag ON ag.genre_id=g.id "
+            "WHERE ag.anime_id=? ORDER BY g.is_vip DESC, g.sort_order",
+            (anime_id,),
+        )
+        return await cur.fetchall()
 
-def confirm_delete_keyboard(anime_id: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Ha, o'chirish", callback_data=f"adm:delete_anime:{anime_id}")
-    b.button(text="❌ Bekor qilish", callback_data=f"adm:anime:{anime_id}")
-    b.adjust(2)
-    return b.as_markup()
+    async def search_anime_by_title(self, query: str, limit: int = 15) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT * FROM anime WHERE title LIKE ? AND is_published=1 ORDER BY title LIMIT ?",
+            (f"%{query}%", limit),
+        )
+        return await cur.fetchall()
 
+    async def list_anime_by_genre(self, genre_id: int, page: int, per_page: int = 10) -> list[aiosqlite.Row]:
+        offset = page * per_page
+        cur = await self.conn.execute(
+            "SELECT a.* FROM anime a JOIN anime_genres ag ON ag.anime_id=a.id "
+            "WHERE ag.genre_id=? AND a.is_published=1 ORDER BY a.created_at DESC LIMIT ? OFFSET ?",
+            (genre_id, per_page, offset),
+        )
+        return await cur.fetchall()
 
-def admin_users_list_keyboard(users, page: int, total_pages: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for u in users:
-        name = u.get("full_name") or "Noma'lum"
-        b.button(text=f"{name} (ID:{u['telegram_id']})", callback_data=f"adm:user:{u['telegram_id']}")
-    b.adjust(1)
-    
-    if total_pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:users:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-        if page < total_pages - 1:
-            nav.append(InlineKeyboardButton(text="🔜", callback_data=f"adm:users:{page+1}"))
-        b.row(*nav)
-        
-    b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm:panel"))
-    return b.as_markup()
+    async def count_published_anime(self) -> int:
+        cur = await self.conn.execute("SELECT COUNT(*) FROM anime WHERE is_published=1")
+        (n,) = await cur.fetchone()
+        return n
 
+    async def count_anime_by_genre(self, genre_id: int) -> int:
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM anime a JOIN anime_genres ag ON ag.anime_id=a.id "
+            "WHERE ag.genre_id=? AND a.is_published=1",
+            (genre_id,),
+        )
+        (n,) = await cur.fetchone()
+        return n
 
-def admin_user_detail_keyboard(telegram_id: int, is_admin_flag: bool) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="💎 VIP berish", callback_data=f"adm:grant_vip_menu:{telegram_id}")
-    if is_admin_flag:
-        b.button(text="👤 Admin huquqini olib tashlash", callback_data=f"adm:revoke_admin:{telegram_id}")
-    else:
-        b.button(text="🛡 Admin qilish", callback_data=f"adm:make_admin:{telegram_id}")
-    b.button(text="⬅️ Orqaga", callback_data="adm:users:0")
-    b.adjust(1)
-    return b.as_markup()
+    async def list_new_anime(self, page: int = 0, per_page: int = 10) -> list[aiosqlite.Row]:
+        offset = page * per_page
+        cur = await self.conn.execute(
+            "SELECT * FROM anime WHERE is_published=1 ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (per_page, offset),
+        )
+        return await cur.fetchall()
 
+    async def list_popular_anime(self, page: int = 0, per_page: int = 10) -> list[aiosqlite.Row]:
+        """Sevimlilar soni bo'yicha mashhurlik."""
+        offset = page * per_page
+        cur = await self.conn.execute(
+            "SELECT a.*, COUNT(f.id) as fav_count FROM anime a "
+            "LEFT JOIN favorites f ON f.anime_id=a.id "
+            "WHERE a.is_published=1 GROUP BY a.id ORDER BY fav_count DESC, a.created_at DESC "
+            "LIMIT ? OFFSET ?",
+            (per_page, offset),
+        )
+        return await cur.fetchall()
 
-def broadcast_control_keyboard(broadcast_id: int, paused: bool) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    if paused:
-        b.button(text="▶️ Davom ettirish", callback_data=f"adm:bc_resume:{broadcast_id}")
-    else:
-        b.button(text="⏸ To'xtatish", callback_data=f"adm:bc_pause:{broadcast_id}")
-    b.adjust(1)
-    return b.as_markup()
+    async def list_top_rated(self, limit: int = 10) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT a.*, AVG(r.score) as avg_score, COUNT(r.id) as rate_count FROM anime a "
+            "JOIN ratings r ON r.anime_id=a.id WHERE a.is_published=1 "
+            "GROUP BY a.id HAVING rate_count > 0 ORDER BY avg_score DESC, rate_count DESC LIMIT ?",
+            (limit,),
+        )
+        return await cur.fetchall()
+
+    async def anime_avg_rating(self, anime_id: int) -> tuple[float, int]:
+        cur = await self.conn.execute(
+            "SELECT AVG(score), COUNT(*) FROM ratings WHERE anime_id=?", (anime_id,)
+        )
+        avg, count = await cur.fetchone()
+        return (round(avg, 1) if avg else 0.0, count or 0)
+
+    async def all_anime_for_random(self) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM anime WHERE is_published=1")
+        return await cur.fetchall()
+
+    # ------------------------------------------------------------------ #
+    # Episodes
+    # ------------------------------------------------------------------ #
+    async def add_episode(self, anime_id: int, video_file_id: str) -> aiosqlite.Row:
+        cur = await self.conn.execute(
+            "SELECT COALESCE(MAX(episode_number),0)+1 FROM episodes WHERE anime_id=?", (anime_id,)
+        )
+        (next_num,) = await cur.fetchone()
+        await self.conn.execute(
+            "INSERT INTO episodes (anime_id, episode_number, video_file_id, created_at) "
+            "VALUES (?,?,?,?)",
+            (anime_id, next_num, video_file_id, _now()),
+        )
+        await self.conn.commit()
+        cur = await self.conn.execute(
+            "SELECT * FROM episodes WHERE anime_id=? AND episode_number=?", (anime_id, next_num)
+        )
+        return await cur.fetchone()
+
+    async def count_episodes(self, anime_id: int) -> int:
+        cur = await self.conn.execute("SELECT COUNT(*) FROM episodes WHERE anime_id=?", (anime_id,))
+        (n,) = await cur.fetchone()
+        return n
+
+    async def list_episodes_page(self, anime_id: int, page: int) -> list[aiosqlite.Row]:
+        per_page = config.EPISODES_PER_PAGE
+        offset = page * per_page
+        cur = await self.conn.execute(
+            "SELECT * FROM episodes WHERE anime_id=? ORDER BY episode_number LIMIT ? OFFSET ?",
+            (anime_id, per_page, offset),
+        )
+        return await cur.fetchall()
+
+    async def get_episode(self, episode_id: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM episodes WHERE id=?", (episode_id,))
+        return await cur.fetchone()
+
+    async def get_episode_by_number(self, anime_id: int, number: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT * FROM episodes WHERE anime_id=? AND episode_number=?", (anime_id, number)
+        )
+        return await cur.fetchone()
+
+    # ------------------------------------------------------------------ #
+    # Ratings
+    # ------------------------------------------------------------------ #
+    async def rate_anime(self, anime_id: int, telegram_id: int, score: int) -> None:
+        user = await self.get_user(telegram_id)
+        await self.conn.execute(
+            "INSERT INTO ratings (anime_id, user_id, score, rated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(anime_id, user_id) DO UPDATE SET score=excluded.score, rated_at=excluded.rated_at",
+            (anime_id, user["id"], score, _now()),
+        )
+        await self.conn.commit()
+
+    async def has_rated(self, anime_id: int, telegram_id: int) -> bool:
+        user = await self.get_user(telegram_id)
+        if not user:
+            return False
+        cur = await self.conn.execute(
+            "SELECT 1 FROM ratings WHERE anime_id=? AND user_id=?", (anime_id, user["id"])
+        )
+        return (await cur.fetchone()) is not None
+
+    # ------------------------------------------------------------------ #
+    # Favorites
+    # ------------------------------------------------------------------ #
+    async def toggle_favorite(self, anime_id: int, telegram_id: int) -> bool:
+        """True qaytarsa — qo'shildi, False — olib tashlandi."""
+        user = await self.get_user(telegram_id)
+        cur = await self.conn.execute(
+            "SELECT id FROM favorites WHERE user_id=? AND anime_id=?", (user["id"], anime_id)
+        )
+        row = await cur.fetchone()
+        if row:
+            await self.conn.execute("DELETE FROM favorites WHERE id=?", (row["id"],))
+            await self.conn.commit()
+            return False
+        await self.conn.execute(
+            "INSERT INTO favorites (user_id, anime_id, added_at) VALUES (?,?,?)",
+            (user["id"], anime_id, _now()),
+        )
+        await self.conn.commit()
+        return True
+
+    async def is_favorite(self, anime_id: int, telegram_id: int) -> bool:
+        user = await self.get_user(telegram_id)
+        if not user:
+            return False
+        cur = await self.conn.execute(
+            "SELECT 1 FROM favorites WHERE user_id=? AND anime_id=?", (user["id"], anime_id)
+        )
+        return (await cur.fetchone()) is not None
+
+    async def list_favorites(self, telegram_id: int) -> list[aiosqlite.Row]:
+        user = await self.get_user(telegram_id)
+        if not user:
+            return []
+        cur = await self.conn.execute(
+            "SELECT a.* FROM anime a JOIN favorites f ON f.anime_id=a.id "
+            "WHERE f.user_id=? ORDER BY f.added_at DESC",
+            (user["id"],),
+        )
+        return await cur.fetchall()
+
+    # ------------------------------------------------------------------ #
+    # Watch history
+    # ------------------------------------------------------------------ #
+    async def log_watch(self, telegram_id: int, anime_id: int, episode_id: int) -> None:
+        user = await self.get_user(telegram_id)
+        await self.conn.execute(
+            "INSERT INTO watch_history (user_id, anime_id, episode_id, watched_at) VALUES (?,?,?,?)",
+            (user["id"], anime_id, episode_id, _now()),
+        )
+        await self.conn.commit()
+
+    async def list_watch_history(self, telegram_id: int, limit: int = 20) -> list[aiosqlite.Row]:
+        user = await self.get_user(telegram_id)
+        if not user:
+            return []
+        cur = await self.conn.execute(
+            "SELECT a.*, MAX(wh.watched_at) as last_watched FROM watch_history wh "
+            "JOIN anime a ON a.id=wh.anime_id WHERE wh.user_id=? "
+            "GROUP BY a.id ORDER BY last_watched DESC LIMIT ?",
+            (user["id"], limit),
+        )
+        return await cur.fetchall()
+
+    # ------------------------------------------------------------------ #
+    # VIP to'lovlari
+    # ------------------------------------------------------------------ #
+    async def create_pending_payment(self, telegram_id: int, months: int, price: int,
+                                      screenshot_file_id: str) -> int:
+        user = await self.get_user(telegram_id)
+        cur = await self.conn.execute(
+            "INSERT INTO pending_payments (user_id, months, price, screenshot_file_id, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (user["id"], months, price, screenshot_file_id, _now()),
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def get_pending_payment(self, payment_id: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM pending_payments WHERE id=?", (payment_id,))
+        return await cur.fetchone()
+
+    async def resolve_payment(self, payment_id: int, status: str, resolved_by: int) -> None:
+        await self.conn.execute(
+            "UPDATE pending_payments SET status=?, resolved_at=?, resolved_by=? WHERE id=?",
+            (status, _now(), resolved_by, payment_id),
+        )
+        await self.conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # Majburiy obuna kanallari
+    # ------------------------------------------------------------------ #
+    async def list_required_channels(self) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM required_channels ORDER BY id")
+        return await cur.fetchall()
+
+    async def add_required_channel(self, chat_id: str, title: str) -> None:
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO required_channels (chat_id, title) VALUES (?,?)",
+            (chat_id, title),
+        )
+        await self.conn.commit()
+
+    async def remove_required_channel(self, channel_pk: int) -> None:
+        await self.conn.execute("DELETE FROM required_channels WHERE id=?", (channel_pk,))
+        await self.conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # Broadcasts
+    # ------------------------------------------------------------------ #
+    async def create_broadcast(self, content_type: str, payload: str, total: int,
+                                created_by: int) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO broadcasts (content_type, payload, total_count, created_at, created_by) "
+            "VALUES (?,?,?,?,?)",
+            (content_type, payload, total, _now(), created_by),
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def update_broadcast_progress(self, broadcast_id: int, sent: int, failed: int) -> None:
+        await self.conn.execute(
+            "UPDATE broadcasts SET sent_count=?, failed_count=? WHERE id=?",
+            (sent, failed, broadcast_id),
+        )
+        await self.conn.commit()
+
+    async def set_broadcast_status(self, broadcast_id: int, status: str) -> None:
+        await self.conn.execute(
+            "UPDATE broadcasts SET status=? WHERE id=?", (status, broadcast_id)
+        )
+        await self.conn.commit()
+
+    async def get_broadcast(self, broadcast_id: int) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM broadcasts WHERE id=?", (broadcast_id,))
+        return await cur.fetchone()
+
+    # ------------------------------------------------------------------ #
+    # Statistika
+    # ------------------------------------------------------------------ #
+    async def stats(self) -> dict[str, Any]:
+        cur = await self.conn.execute("SELECT COUNT(*) FROM anime")
+        (anime_count,) = await cur.fetchone()
+        cur = await self.conn.execute("SELECT COUNT(*) FROM episodes")
+        (episode_count,) = await cur.fetchone()
+        return {
+            "users": await self.count_users(),
+            "vip_users": await self.count_vip_users(),
+            "anime": anime_count,
+            "episodes": episode_count,
+}
