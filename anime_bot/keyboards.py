@@ -272,6 +272,12 @@ class Database:
         )
         await self.conn.commit()
 
+    async def get_admin_ids(self) -> list[int]:
+        """Barcha adminlarning telegram_id ro'yxatini qaytaradi."""
+        cur = await self.conn.execute("SELECT telegram_id FROM users WHERE is_admin=1")
+        rows = await cur.fetchall()
+        return [r["telegram_id"] for r in rows]
+
     async def is_vip(self, telegram_id: int) -> bool:
         user = await self.get_user(telegram_id)
         if not user or not user["vip_until"]:
@@ -710,4 +716,4 @@ class Database:
             "vip_users": await self.count_vip_users(),
             "anime": anime_count,
             "episodes": episode_count,
-}
+        }
