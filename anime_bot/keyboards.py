@@ -71,10 +71,13 @@ def genres_menu(genres, selected_ids: set[int] | None = None, for_admin_add: boo
     for g in genres:
         mark = "✅ " if g["id"] in selected_ids else ""
         prefix = "search_genre" if not for_admin_add else "pick_genre"
-        b.button(text=f"{mark}{g['emoji']} {g['name']}", callback_data=f"{prefix}:{g['id']}")
-    b.adjust(2)
+        b.button(text=f"{mark}{g.get('emoji', '')} {g['name']}", callback_data=f"{prefix}:{g['id']}")
+    
+    b.adjust(2)  # Janrlarni 2 ustun qilib joylaymiz
+    
     if for_admin_add:
         b.row(InlineKeyboardButton(text="✅ Tayyor", callback_data="pick_genre:done"))
+        
     return b.as_markup()
 
 
@@ -88,6 +91,7 @@ def anime_list_keyboard(anime_rows, page: int, total_pages: int, list_kind: str)
     for a in anime_rows:
         b.button(text=f"{a['title']} (ID: {a['anime_code']})", callback_data=f"anime:{a['id']}")
     b.adjust(1)
+    
     if total_pages > 1:
         nav = []
         if page > 0:
@@ -96,6 +100,7 @@ def anime_list_keyboard(anime_rows, page: int, total_pages: int, list_kind: str)
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"list:{list_kind}:{page+1}"))
         b.row(*nav)
+        
     return b.as_markup()
 
 
@@ -112,9 +117,7 @@ def anime_detail_keyboard(anime_id: int, is_favorite: bool, has_rated: bool) -> 
 
 def rating_keyboard(anime_id: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for i in range(1, 6):
-        b.button(text=f"{i}⭐", callback_data=f"rate:{anime_id}:{i}")
-    for i in range(6, 11):
+    for i in range(1, 11):
         b.button(text=f"{i}⭐", callback_data=f"rate:{anime_id}:{i}")
     b.adjust(5, 5)
     return b.as_markup()
@@ -124,9 +127,13 @@ def episodes_keyboard(anime_id: int, episodes, page: int, total_episodes: int) -
     b = InlineKeyboardBuilder()
     for ep in episodes:
         b.button(text=str(ep["episode_number"]), callback_data=f"watch:{ep['id']}")
-    b.adjust(config.EPISODE_BUTTONS_COLUMNS)
+    
+    cols = getattr(config, 'EPISODE_BUTTONS_COLUMNS', 5)
+    b.adjust(cols)
 
-    total_pages = max(1, math.ceil(total_episodes / config.EPISODES_PER_PAGE))
+    per_page = getattr(config, 'EPISODES_PER_PAGE', 10)
+    total_pages = max(1, math.ceil(total_episodes / per_page))
+    
     if total_pages > 1:
         nav = []
         if page > 0:
@@ -135,6 +142,7 @@ def episodes_keyboard(anime_id: int, episodes, page: int, total_episodes: int) -
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="🔜", callback_data=f"episodes:{anime_id}:{page+1}"))
         b.row(*nav)
+        
     b.row(InlineKeyboardButton(text="⬅️ Anime sahifasiga", callback_data=f"anime:{anime_id}"))
     return b.as_markup()
 
@@ -176,11 +184,11 @@ def grant_vip_keyboard(user_telegram_id: int) -> InlineKeyboardMarkup:
 def subscribe_keyboard(channels) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for ch in channels:
-        link = ch["chat_id"]
+        link = str(ch["chat_id"])
         if not link.startswith("http"):
             uname = link.lstrip("@")
             link = f"https://t.me/{uname}"
-        b.button(text=f"📢 {ch['title'] or ch['chat_id']}", url=link)
+        b.button(text=f"📢 {ch.get('title') or ch['chat_id']}", url=link)
     b.adjust(1)
     b.row(InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subs"))
     return b.as_markup()
@@ -264,7 +272,7 @@ def help_settings_menu() -> InlineKeyboardMarkup:
 def channels_menu(channels) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for ch in channels:
-        b.button(text=f"❌ {ch['title'] or ch['chat_id']}", callback_data=f"adm:del_channel:{ch['id']}")
+        b.button(text=f"❌ {ch.get('title') or ch['chat_id']}", callback_data=f"adm:del_channel:{ch['id']}")
     b.button(text="➕ Kanal qo'shish", callback_data="adm:add_channel")
     b.button(text="⬅️ Orqaga", callback_data="adm:panel")
     b.adjust(1)
@@ -276,14 +284,16 @@ def admin_anime_list_keyboard(anime_rows, page: int, total_pages: int) -> Inline
     for a in anime_rows:
         b.button(text=f"{a['title']} (ID:{a['anime_code']})", callback_data=f"adm:anime:{a['id']}")
     b.adjust(1)
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:anime_list:{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="🔜", callback_data=f"adm:anime_list:{page+1}"))
+    
     if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:anime_list:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="🔜", callback_data=f"adm:anime_list:{page+1}"))
         b.row(*nav)
+        
     b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm:panel"))
     return b.as_markup()
 
@@ -312,17 +322,19 @@ def confirm_delete_keyboard(anime_id: int) -> InlineKeyboardMarkup:
 def admin_users_list_keyboard(users, page: int, total_pages: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for u in users:
-        name = u["full_name"] or "Noma'lum"
+        name = u.get("full_name") or "Noma'lum"
         b.button(text=f"{name} (ID:{u['telegram_id']})", callback_data=f"adm:user:{u['telegram_id']}")
     b.adjust(1)
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:users:{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="🔜", callback_data=f"adm:users:{page+1}"))
+    
     if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:users:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="🔜", callback_data=f"adm:users:{page+1}"))
         b.row(*nav)
+        
     b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm:panel"))
     return b.as_markup()
 
@@ -345,4 +357,5 @@ def broadcast_control_keyboard(broadcast_id: int, paused: bool) -> InlineKeyboar
         b.button(text="▶️ Davom ettirish", callback_data=f"adm:bc_resume:{broadcast_id}")
     else:
         b.button(text="⏸ To'xtatish", callback_data=f"adm:bc_pause:{broadcast_id}")
+    b.adjust(1)
     return b.as_markup()
