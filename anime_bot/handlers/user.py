@@ -1,5 +1,5 @@
 
-From __future__ import annotations
+from __future__ import annotations
 
 import html
 import logging
