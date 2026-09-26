@@ -1,15 +1,13 @@
-
 from __future__ import annotations
 
-import html
 import logging
 import math
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
+from aiogram.exceptions import TelegramBadRequest
 
 import keyboards as kb
 from database import Database
@@ -40,6 +38,7 @@ async def cmd_start(message: Message, db: Database, state: FSMContext):
         return
 
     # Kanaldagi "▶️ Animeni ko'rish" tugmasi orqali kirilgan bo'lishi mumkin:
+    # https://t.me/<bot>?start=anime_<code>
     args = message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].startswith("anime_"):
         code = args[1][len("anime_"):]
@@ -58,7 +57,7 @@ async def noop(call: CallbackQuery):
 
 
 async def _send_start_message(message: Message, db: Database, is_admin: bool):
-    text = await db.get_setting("start_text", "Xush kelibsiz!")
+    text = await db.get_setting("start_text")
     photo = await db.get_setting("start_photo_file_id")
     markup = kb.main_menu(is_admin=is_admin)
     if photo:
@@ -119,7 +118,7 @@ async def search_top10(call: CallbackQuery, db: Database):
         return
     lines = ["⭐ <b>Eng yuqori baholangan 10 ta anime:</b>\n"]
     for i, a in enumerate(rows, start=1):
-        lines.append(f"{i}. {html.escape(a['title'])} — {a['avg_score']:.1f}⭐ ({a['rate_count']} baho)")
+        lines.append(f"{i}. {a['title']} — {a['avg_score']:.1f}⭐ ({a['rate_count']} baho)")
     await call.message.answer("\n".join(lines), reply_markup=kb.anime_list_keyboard(rows, 0, 1, "top10"))
     await call.answer()
 
@@ -141,7 +140,7 @@ async def do_search_title(message: Message, db: Database, state: FSMContext):
         await message.answer("😕 Hech narsa topilmadi.", reply_markup=kb.main_menu())
         return
     await message.answer(
-        f"🔎 «{html.escape(query)}» bo'yicha natijalar:",
+        f"🔎 «{query}» bo'yicha natijalar:",
         reply_markup=kb.anime_list_keyboard(rows, 0, 1, "search_title"),
     )
 
@@ -214,69 +213,58 @@ async def genre_selected(call: CallbackQuery, db: Database, state: FSMContext):
         return
     total_pages = max(1, math.ceil(await db.count_anime_by_genre(genre_id) / PER_PAGE))
     await call.message.answer(
-        f"{genre['emoji']} <b>{html.escape(genre['name'])}</b> janridagi animelar:",
-        reply_markup=kb.anime_list_keyboard(rows, 0, total_pages, f"genre:{genre_id}"),
+        f"{genre['emoji']} <b>{genre['name']}</b> janridagi animelar:",
+        reply_markup=kb.anime_list_keyboard(rows, 0, total_pages, "genre"),
     )
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("list:"))
 async def list_pagination(call: CallbackQuery, db: Database, state: FSMContext):
-    parts = call.data.split(":")
-    kind = parts[1]
-    
-    if kind == "genre":
-        genre_id = int(parts[2])
-        page = int(parts[3])
-    else:
-        page = int(parts[2])
-
+    _, kind, page_str = call.data.split(":")
+    page = int(page_str)
     per_page = PER_PAGE
 
     if kind == "new":
         rows = await db.list_new_anime(page=page, per_page=per_page)
         title = "🆕 Yangi qo'shilgan animelar:"
         total_pages = max(1, math.ceil(await db.count_published_anime() / per_page))
-        kind_key = "new"
     elif kind == "popular":
         rows = await db.list_popular_anime(page=page, per_page=per_page)
         title = "🔥 Mashhur animelar:"
         total_pages = max(1, math.ceil(await db.count_published_anime() / per_page))
-        kind_key = "popular"
     elif kind == "genre":
-        genre = await db.get_genre(genre_id)
-        rows = await db.list_anime_by_genre(genre_id, page=page, per_page=per_page) if genre else []
-        title = f"{genre['emoji']} {html.escape(genre['name'])} janridagi animelar:" if genre else "Natijalar:"
-        total_pages = max(1, math.ceil((await db.count_anime_by_genre(genre_id) if genre else 0) / per_page))
-        kind_key = f"genre:{genre_id}"
+        data = await state.get_data()
+        genre_id = data.get("genre_id")
+        genre = await db.get_genre(genre_id) if genre_id else None
+        rows = await db.list_anime_by_genre(genre_id, page=page, per_page=per_page) if genre_id else []
+        title = f"{genre['emoji']} {genre['name']} janridagi animelar:" if genre else "Natijalar:"
+        total_pages = max(1, math.ceil((await db.count_anime_by_genre(genre_id) if genre_id else 0) / per_page))
     elif kind == "favorites":
         all_rows = await db.list_favorites(call.from_user.id)
         rows = all_rows[page * per_page:(page + 1) * per_page]
         title = "❤️ Sevimli animelaringiz:"
         total_pages = max(1, math.ceil(len(all_rows) / per_page))
-        kind_key = "favorites"
     elif kind == "search_title":
         data = await state.get_data()
         query = data.get("search_query", "")
         all_rows = await db.search_anime_by_title(query, limit=200)
         rows = all_rows[page * per_page:(page + 1) * per_page]
-        title = f"🔎 «{html.escape(query)}» bo'yicha natijalar:"
+        title = f"🔎 «{query}» bo'yicha natijalar:"
         total_pages = max(1, math.ceil(len(all_rows) / per_page))
-        kind_key = "search_title"
     else:
         rows = []
         title = "Natijalar:"
         total_pages = 1
-        kind_key = kind
 
     if not rows and page > 0:
         await call.answer("Boshqa natija yo'q.", show_alert=True)
         return
 
     try:
-        await call.message.edit_text(title, reply_markup=kb.anime_list_keyboard(rows, page, total_pages, kind_key))
+        await call.message.edit_text(title, reply_markup=kb.anime_list_keyboard(rows, page, total_pages, kind))
     except TelegramBadRequest:
-        await call.message.answer(title, reply_markup=kb.anime_list_keyboard(rows, page, total_pages, kind_key))
+        await call.message.answer(title, reply_markup=kb.anime_list_keyboard(rows, page, total_pages, kind))
     await call.answer()
 
 
@@ -291,7 +279,7 @@ async def show_anime_detail(message: Message, db: Database, anime_id: int, viewe
 
     if anime["is_vip"] and not await db.is_vip(viewer_telegram_id):
         text = (
-            f"💎 <b>{html.escape(anime['title'])}</b>\n\n"
+            f"💎 <b>{anime['title']}</b>\n\n"
             "Bu anime VIP foydalanuvchilar uchun mo'ljallangan.\n"
             "Ko'rish uchun 👤 Profil → 💎 VIP olish orqali VIP xarid qiling."
         )
@@ -299,7 +287,7 @@ async def show_anime_detail(message: Message, db: Database, anime_id: int, viewe
         return
 
     genres = await db.get_anime_genres(anime_id)
-    genre_txt = ", ".join(f"{g['emoji']} {html.escape(g['name'])}" for g in genres) or "—"
+    genre_txt = ", ".join(f"{g['emoji']} {g['name']}" for g in genres) or "—"
     avg, count = await db.anime_avg_rating(anime_id)
     ep_count = await db.count_episodes(anime_id)
     is_fav = await db.is_favorite(anime_id, viewer_telegram_id)
@@ -307,13 +295,13 @@ async def show_anime_detail(message: Message, db: Database, anime_id: int, viewe
 
     rating_txt = f"{avg}⭐ ({count} baho)" if count else "hali baholanmagan"
     caption = (
-        f"🎬 <b>{html.escape(anime['title'])}</b>\n"
-        f"🆔 ID: <code>{html.escape(str(anime['anime_code']))}</code>\n"
+        f"🎬 <b>{anime['title']}</b>\n"
+        f"🆔 ID: <code>{anime['anime_code']}</code>\n"
         f"🎭 Janr: {genre_txt}\n"
         f"⭐ Reyting: {rating_txt}\n"
         f"📼 Qismlar soni: {ep_count}\n"
         f"{'💎 VIP anime' if anime['is_vip'] else ''}\n\n"
-        f"{html.escape(anime['description'] or '')}"
+        f"{anime['description'] or ''}"
     )
     markup = kb.anime_detail_keyboard(anime_id, is_fav, has_rated)
     if anime["poster_file_id"]:
@@ -337,6 +325,7 @@ async def toggle_fav(call: CallbackQuery, db: Database):
     anime_id = int(call.data.split(":")[1])
     added = await db.toggle_favorite(anime_id, call.from_user.id)
     await call.answer("❤️ Sevimlilarga qo'shildi!" if added else "💔 Sevimlilardan olib tashlandi.")
+    anime = await db.get_anime(anime_id)
     is_fav = await db.is_favorite(anime_id, call.from_user.id)
     has_rated = await db.has_rated(anime_id, call.from_user.id)
     try:
@@ -415,7 +404,7 @@ async def show_episodes(call: CallbackQuery, db: Database):
         await call.answer("Hali qismlar qo'shilmagan.", show_alert=True)
         return
     episodes = await db.list_episodes_page(anime_id, page)
-    text = f"🎬 <b>{html.escape(anime['title'])}</b>\nQism raqamini tanlang ({total} ta qism):"
+    text = f"🎬 <b>{anime['title']}</b>\nQism raqamini tanlang ({total} ta qism):"
     markup = kb.episodes_keyboard(anime_id, episodes, page, total)
     try:
         await call.message.edit_text(text, reply_markup=markup)
@@ -439,7 +428,7 @@ async def watch_episode(call: CallbackQuery, db: Database, bot: Bot):
     await bot.send_video(
         chat_id=call.from_user.id,
         video=episode["video_file_id"],
-        caption=f"🎬 {html.escape(anime['title'])} — {episode['episode_number']}-qism",
+        caption=f"🎬 {anime['title']} — {episode['episode_number']}-qism",
         protect_content=bool(anime["is_vip"]),
     )
     await db.log_watch(call.from_user.id, anime["id"], episode["id"])
@@ -460,12 +449,14 @@ async def profile(message: Message, db: Database):
     if is_vip and user["vip_until"]:
         vip_until_txt = f"\n⏳ VIP tugash sanasi: {user['vip_until'][:10]}"
 
-    username_line = f"🔗 Username: @{html.escape(user['username'])}\n" if user["username"] else "🔗 Username: —\n"
+    username_line = f"🔗 Username: @{user['username']}\n" if user["username"] else "🔗 Username: —\n"
     text = (
         f"👤 <b>Profil</b>\n\n"
         f"🆔 ID: <code>{user['telegram_id']}</code>\n"
-        f"👨‍💼 Ism: {html.escape(user['full_name'])}\n"
+        f"👨‍💼 Ism: {user['full_name']}\n"
         f"{username_line}"
+    )
+    text += (
         f"📊 Status: {status}{vip_until_txt}\n"
         f"💰 Balans: {fmt_number(user['balance'])} so'm\n"
         f"❤️ Sevimlilar: {len(favs)} ta\n"
@@ -505,8 +496,8 @@ async def vip_buy(call: CallbackQuery, db: Database, state: FSMContext):
     text = (
         f"💳 <b>{months} oylik VIP — {fmt_number(price)} so'm</b>\n\n"
         f"To'lovni quyidagi kartaga amalga oshiring:\n"
-        f"💳 Karta: <code>{html.escape(card_number)}</code>\n"
-        f"👤 Egasi: {html.escape(card_holder)}\n\n"
+        f"💳 Karta: <code>{card_number}</code>\n"
+        f"👤 Egasi: {card_holder}\n\n"
         f"To'lovni amalga oshirgach, chek (screenshot) rasmini shu yerga yuboring 📸"
     )
     await call.message.answer(text, reply_markup=kb.cancel_menu())
@@ -529,16 +520,11 @@ async def vip_receive_screenshot(message: Message, db: Database, state: FSMConte
         reply_markup=kb.main_menu(is_admin=bool(user["is_admin"])),
     )
 
-    admin_ids = await db.get_admin_ids() if hasattr(db, 'get_admin_ids') else []
-    if not admin_ids:
-        admins_cur = await db.conn.execute("SELECT telegram_id FROM users WHERE is_admin=1")
-        rows = await admins_cur.fetchall()
-        admin_ids = [r["telegram_id"] for r in rows]
-
-    username = f"@{message.from_user.username}" if message.from_user.username else "—"
+    admins_cur = await db.conn.execute("SELECT telegram_id FROM users WHERE is_admin=1")
+    admin_ids = [r["telegram_id"] for r in await admins_cur.fetchall()]
     caption = (
         f"💳 <b>Yangi VIP to'lov</b>\n\n"
-        f"👤 Foydalanuvchi: {html.escape(message.from_user.full_name)} ({username})\n"
+        f"👤 Foydalanuvchi: {message.from_user.full_name} (@{message.from_user.username or '—'})\n"
         f"🆔 ID: <code>{message.from_user.id}</code>\n"
         f"📦 Paket: {months} oylik\n"
         f"💰 Narx: {fmt_number(price)} so'm"
@@ -563,9 +549,9 @@ async def vip_screenshot_wrong_type(message: Message):
 # ------------------------------------------------------------------ #
 @router.message(F.text == "🆘 Yordam")
 async def help_menu(message: Message, db: Database):
-    text = await db.get_setting("help_text", "Yordam bo'limi")
+    text = await db.get_setting("help_text")
     admin_username = await db.get_setting("help_admin_username")
     full = text
     if admin_username:
-        full += f"\n\n📢 Reklama va murojaat uchun\n👤 Admin: @{html.escape(admin_username.lstrip('@'))}"
+        full += f"\n\n📢 Reklama va murojaat uchun\n👤 Admin: @{admin_username.lstrip('@')}"
     await message.answer(full)
