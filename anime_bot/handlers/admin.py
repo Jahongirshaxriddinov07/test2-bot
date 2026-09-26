@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +8,7 @@ import math
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, Message
 
 import config
 import keyboards as kb
@@ -28,18 +27,8 @@ PER_PAGE = 10
 _broadcast_flags: dict[int, dict] = {}
 
 
-def get_episode_control_kb() -> ReplyKeyboardMarkup:
-    """Qism yuklash jarayoni uchun boshqaruv tugmalari"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Tayyor"), KeyboardButton(text="❌ Bekor qilish")]
-        ],
-        resize_keyboard=True
-    )
-
-
 # ------------------------------------------------------------------ #
-# Kirish va Holatni tozalash
+# Kirish
 # ------------------------------------------------------------------ #
 @router.message(F.text == "⚙️ Admin panel")
 async def open_admin_panel(message: Message, state: FSMContext):
@@ -236,7 +225,7 @@ async def admin_edit_title_save(message: Message, state: FSMContext, db: Databas
     await db.conn.execute("UPDATE anime SET title=? WHERE id=?", (message.text.strip(), anime_id))
     await db.conn.commit()
     await state.clear()
-    await ensure_user(db, message.from_user)
+    user = await ensure_user(db, message.from_user)
     await message.answer("✅ Nomi yangilandi.", reply_markup=kb.main_menu(is_admin=True))
     await message.answer("⚙️ Admin panel:", reply_markup=kb.admin_panel_menu())
 
@@ -329,70 +318,36 @@ async def admin_delete_anime(call: CallbackQuery, db: Database):
 
 
 # ------------------------------------------------------------------ #
-# Qism qo'shish (To'g'rilangan FSM va tugmalar bilan)
+# Qism qo'shish
 # ------------------------------------------------------------------ #
 @router.callback_query(F.data.startswith("adm:add_episode:"))
 async def add_episode_start(call: CallbackQuery, state: FSMContext):
     anime_id = int(call.data.split(":")[2])
-    await state.update_data(episode_anime_id=anime_id, added_count=0)
+    await state.update_data(episode_anime_id=anime_id)
     await state.set_state(AddEpisodeStates.waiting_video)
     await call.message.answer(
         "📼 Video(lar)ni yuboring. Har bir yuborilgan video keyingi qism sifatida "
-        "avtomatik raqamlanadi.\n\nTugatgach ✅ Tayyor yoki ❌ Bekor qilish tugmasini bosing.",
-        reply_markup=get_episode_control_kb(),
+        "avtomatik raqamlanadi. Tugatgach ❌ Bekor qilish tugmasini bosing.",
+        reply_markup=kb.cancel_menu(),
     )
     await call.answer()
-
-
-@router.message(AddEpisodeStates.waiting_video, F.text == "❌ Bekor qilish")
-async def cancel_add_episode(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "❌ Qism qo'shish bekor qilindi.",
-        reply_markup=kb.main_menu(is_admin=True)
-    )
-    await message.answer("⚙️ Admin panel:", reply_markup=kb.admin_panel_menu())
-
-
-@router.message(AddEpisodeStates.waiting_video, F.text == "✅ Tayyor")
-async def finish_add_episode(message: Message, state: FSMContext):
-    data = await state.get_data()
-    added_count = data.get("added_count", 0)
-    await state.clear()
-    await message.answer(
-        f"🎉 Qismlarni yuklash yakunlandi! Jami {added_count} ta yangi qism qo'shildi.",
-        reply_markup=kb.main_menu(is_admin=True)
-    )
-    await message.answer("⚙️ Admin panel:", reply_markup=kb.admin_panel_menu())
 
 
 @router.message(AddEpisodeStates.waiting_video, F.video)
 async def add_episode_video(message: Message, state: FSMContext, db: Database):
     data = await state.get_data()
     anime_id = data["episode_anime_id"]
-    added_count = data.get("added_count", 0)
-    
     episode = await db.add_episode(anime_id, message.video.file_id)
-    added_count += 1
-    await state.update_data(added_count=added_count)
-    
-    await message.answer(
-        f"✅ {episode['episode_number']}-qism qo'shildi.\n"
-        f"Davom eting yoki tugatish uchun «✅ Tayyor» bosing.",
-        reply_markup=get_episode_control_kb()
-    )
+    await message.answer(f"✅ {episode['episode_number']}-qism qo'shildi. Davom eting yoki bekor qiling.")
 
 
 @router.message(AddEpisodeStates.waiting_video)
 async def add_episode_wrong_type(message: Message):
-    await message.answer(
-        "📼 Iltimos, video fayl yuboring yoki quyidagi tugmalardan birini bosing:",
-        reply_markup=get_episode_control_kb()
-    )
+    await message.answer("📼 Iltimos video fayl yuboring.")
 
 
 # ------------------------------------------------------------------ #
-# Kanalga e'lon qilish (Anime ID avtomatik qo'shiladi)
+# Kanalga e'lon qilish
 # ------------------------------------------------------------------ #
 @router.callback_query(F.data.startswith("adm:announce:"))
 async def announce_anime(call: CallbackQuery, db: Database, bot: Bot):
@@ -411,14 +366,10 @@ async def _post_announcement(bot: Bot, db: Database, anime_id: int) -> bool:
     genres = await db.get_anime_genres(anime_id)
     genre_txt = ", ".join(f"{g['emoji']} {g['name']}" for g in genres) or "—"
     bot_info = await bot.get_me()
-    
-    # Caption matniga Anime ID avtomatik joylanadi
     caption = (
-        f"🎬 <b>{anime['title']}</b>\n\n"
-        f"📝 <b>Tavsif:</b> {anime['description'] or 'Mavjud emas'}\n"
-        f"🎭 <b>Janr:</b> {genre_txt}\n"
-        f"🆔 <b>Anime ID:</b> <code>{anime['anime_code']}</code>\n\n"
-        f"🤖 <b>Botimiz:</b> @{bot_info.username}"
+        f"🆕 <b>{anime['title']}</b>\n\n"
+        f"🎭 Janr: {genre_txt}\n"
+        f"{anime['description'] or ''}"
     )
     markup = kb.InlineKeyboardMarkup(inline_keyboard=[[
         kb.InlineKeyboardButton(
@@ -865,7 +816,7 @@ async def broadcast_start(call: CallbackQuery, state: FSMContext):
 @router.message(BroadcastStates.waiting_content)
 async def broadcast_receive(message: Message, state: FSMContext, db: Database, bot: Bot):
     await state.clear()
-    await ensure_user(db, message.from_user)
+    user = await ensure_user(db, message.from_user)
     ids = await db.all_telegram_ids()
     broadcast_id = await db.create_broadcast(
         content_type="copy",
@@ -916,7 +867,7 @@ async def _run_broadcast(bot: Bot, db: Database, broadcast_id: int, user_ids: li
                 )
             except Exception:
                 pass
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # Telegram limitlariga hurmat
 
     await db.set_broadcast_status(broadcast_id, "done")
     _broadcast_flags.pop(broadcast_id, None)
