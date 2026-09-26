@@ -6,10 +6,6 @@ class SearchStates(StatesGroup):
     waiting_code = State()
 
 
-class RatingStates(StatesGroup):
-    pass  # baholash to'liq inline callback orqali, FSM shart emas
-
-
 class VipPaymentStates(StatesGroup):
     waiting_screenshot = State()
 
@@ -40,9 +36,7 @@ class AdminTextStates(StatesGroup):
     waiting_start_photo = State()
     waiting_help_text = State()
     waiting_help_admin_username = State()
-    waiting_vip_price_1 = State()
-    waiting_vip_price_2 = State()
-    waiting_vip_price_3 = State()
+    waiting_vip_price = State()  # Oylar uchun yagona state (oy varianti state data'da saqlanadi)
     waiting_card_number = State()
     waiting_card_holder = State()
     waiting_required_channel = State()
