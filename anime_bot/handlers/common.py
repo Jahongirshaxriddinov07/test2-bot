@@ -1,10 +1,13 @@
 """Umumiy yordamchi funksiyalar: majburiy obuna tekshiruvi va h.k."""
 from __future__ import annotations
 
-from aiogram import Bot
-from aiogram.filters import BaseFilter
-from aiogram.types import TelegramObject, User as TgUser
+from typing import Any, Awaitable, Callable, Dict, Optional
 
+from aiogram import BaseMiddleware, Bot
+from aiogram.filters import BaseFilter
+from aiogram.types import CallbackQuery, Message, TelegramObject, User as TgUser
+
+import keyboards as kb
 from database import Database
 
 
@@ -33,6 +36,76 @@ async def is_subscribed_to_all(bot: Bot, db: Database, telegram_id: int) -> list
             # lekin adminlar buni logdan ko'rishi mumkin.
             continue
     return missing
+
+
+async def has_vip_access(db: Database, telegram_id: int) -> bool:
+    """
+    Foydalanuvchi VIP kontentga kira oladimi: o'zi haqiqiy VIP bo'lsa,
+    YOKI hozir admin yoqqan vaqtinchalik "hammaga bepul" VIP rejimi
+    faol bo'lsa — True qaytaradi.
+    """
+    if await db.is_vip(telegram_id):
+        return True
+    return await db.is_vip_free_mode()
+
+
+class SubscriptionMiddleware(BaseMiddleware):
+    """
+    Har bir foydalanuvchi harakatida (matn buyruq yoki inline tugma bosilganda)
+    majburiy kanal(lar)ga obuna HALI HAM davom etayotganini qayta tekshiradi.
+
+    Muammo: avvalgi kodda bu tekshiruv faqat /start bosilganda bo'lardi — foydalanuvchi
+    bir marta obuna bo'lib, keyin kanaldan chiqib ketsa ham bot buni bilmasdi.
+    Endi har bir harakatda (admin va /start/✅ Tekshirishdan tashqari) tekshiriladi.
+    """
+
+    SKIP_CALLBACKS = {"check_subs"}
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        tg_user: Optional[TgUser] = data.get("event_from_user")
+        if tg_user is None:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            if event.text and event.text.startswith("/start"):
+                return await handler(event, data)
+        elif isinstance(event, CallbackQuery):
+            if event.data in self.SKIP_CALLBACKS:
+                return await handler(event, data)
+        else:
+            return await handler(event, data)
+
+        db: Database = data["db"]
+        bot: Bot = data["bot"]
+
+        # Adminlar bloklanmaydi — ular botni boshqarishda davom etishi kerak.
+        if await db.is_admin(tg_user.id):
+            return await handler(event, data)
+
+        missing = await is_subscribed_to_all(bot, db, tg_user.id)
+        if missing:
+            text = (
+                "📢 Davom etish uchun quyidagi majburiy kanal(lar)ga obuna bo'ling "
+                "(shekilli, avval obuna bo'lgan kanal(lar)dan chiqib ketgansiz), "
+                "so'ng ✅ Tekshirish tugmasini bosing:"
+            )
+            markup = kb.subscribe_keyboard(missing)
+            if isinstance(event, CallbackQuery):
+                await event.answer("❗ Majburiy kanal(lar)ga obuna talab qilinadi.", show_alert=True)
+                try:
+                    await event.message.answer(text, reply_markup=markup)
+                except Exception:
+                    pass
+            else:
+                await event.answer(text, reply_markup=markup)
+            return  # handlerga o'tkazmaymiz — harakat shu yerda to'xtaydi
+
+        return await handler(event, data)
 
 
 async def ensure_user(db: Database, tg_user: TgUser):

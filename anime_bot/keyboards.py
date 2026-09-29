@@ -200,11 +200,25 @@ def grant_vip_keyboard(user_telegram_id: int) -> InlineKeyboardMarkup:
 def subscribe_keyboard(channels) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for ch in channels:
-        link = ch["chat_id"]
-        if not link.startswith("http"):
-            uname = link.lstrip("@")
-            link = f"https://t.me/{uname}"
-        b.button(text=f"📢 {ch['title'] or ch['chat_id']}", url=link)
+        chat_id = ch["chat_id"]
+        title = ch["title"] or chat_id
+        invite_link = ch["invite_link"] if "invite_link" in ch.keys() else None
+
+        if chat_id.startswith("@"):
+            link = f"https://t.me/{chat_id.lstrip('@')}"
+        elif chat_id.startswith("http"):
+            link = chat_id
+        elif invite_link:
+            # -100... ko'rinishidagi ID orqali qo'shilgan kanal — faqat oldindan
+            # yaratilgan haqiqiy taklif linki mavjud bo'lsagina tugma qo'yamiz.
+            link = invite_link
+        else:
+            # Taklif linki yo'q — ishlamaydigan havola yasashdan ko'ra, tugmani
+            # umuman qo'ymay, kanal nomini oddiy noop qatorida ko'rsatamiz.
+            b.button(text=f"⚠️ {title} (admin bilan bog'laning)", callback_data="noop")
+            continue
+
+        b.button(text=f"📢 {title}", url=link)
     b.adjust(1)
     b.row(InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subs"))
     return b.as_markup()
@@ -234,10 +248,11 @@ def admin_panel_menu() -> InlineKeyboardMarkup:
     b.button(text="📢 Reklama", callback_data="adm:broadcast")
     b.button(text="📢 Majburiy kanallar", callback_data="adm:channels")
     b.button(text="💰 VIP narxlari", callback_data="adm:vip_prices")
+    b.button(text="🎁 VIP'ni vaqtincha bepul qilish", callback_data="adm:vip_free_menu")
     b.button(text="💳 To'lov ma'lumotlari", callback_data="adm:payment_info")
     b.button(text="🖼 /start rasm/matn", callback_data="adm:start_settings")
     b.button(text="🆘 Yordam matni", callback_data="adm:help_settings")
-    b.button(text="💾 Zaxira nusxa (Backup)", callback_data="adm:backup")
+    b.button(text="💾 Zaxira nusxa (Backup)", callback_data="adm:backup_menu")
     b.adjust(1)
     return b.as_markup()
 
@@ -245,6 +260,18 @@ def admin_panel_menu() -> InlineKeyboardMarkup:
 def admin_back_button(target: str = "adm:panel") -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="⬅️ Orqaga", callback_data=target)
+    return b.as_markup()
+
+
+def vip_free_menu(active: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📅 1 hafta bepul", callback_data="adm:vip_free_set:7")
+    b.button(text="📅 2 hafta bepul", callback_data="adm:vip_free_set:14")
+    b.button(text="📅 1 oy bepul", callback_data="adm:vip_free_set:30")
+    b.adjust(1)
+    if active:
+        b.row(InlineKeyboardButton(text="🛑 Bepul rejimni to'xtatish", callback_data="adm:vip_free_stop"))
+    b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm:panel"))
     return b.as_markup()
 
 
@@ -351,15 +378,34 @@ def admin_users_list_keyboard(users, page: int, total_pages: int) -> InlineKeybo
     return b.as_markup()
 
 
-def admin_user_detail_keyboard(telegram_id: int, is_admin_flag: bool) -> InlineKeyboardMarkup:
+def admin_user_detail_keyboard(telegram_id: int, is_admin_flag: bool, is_vip_flag: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💎 VIP berish", callback_data=f"adm:grant_vip_menu:{telegram_id}")
+    if is_vip_flag:
+        b.button(text="❌ VIP'ni bekor qilish", callback_data=f"adm:revoke_vip:{telegram_id}")
     if is_admin_flag:
         b.button(text="👤 Admin huquqini olib tashlash", callback_data=f"adm:revoke_admin:{telegram_id}")
     else:
         b.button(text="🛡 Admin qilish", callback_data=f"adm:make_admin:{telegram_id}")
     b.button(text="⬅️ Orqaga", callback_data="adm:users:0")
     b.adjust(1)
+    return b.as_markup()
+
+
+def backup_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💾 Zaxira olish", callback_data="adm:backup_export")
+    b.button(text="📥 Zaxiradan tiklash", callback_data="adm:backup_import")
+    b.button(text="⬅️ Orqaga", callback_data="adm:panel")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def confirm_restore_keyboard() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Ha, tiklash", callback_data="adm:backup_import_confirm")
+    b.button(text="❌ Bekor qilish", callback_data="adm:backup_import_cancel")
+    b.adjust(2)
     return b.as_markup()
 
 

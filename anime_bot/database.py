@@ -19,6 +19,32 @@ import config
 
 logger = logging.getLogger("anime_bot.db")
 
+
+async def validate_sqlite_backup(path: str) -> tuple[bool, str]:
+    """
+    Berilgan fayl haqiqiy va bizning botimizga mos SQLite zaxira ekanligini tekshiradi.
+    (ok, xabar) qaytaradi — ok=False bo'lsa, xabar foydalanuvchiga ko'rsatiladigan sabab.
+    """
+    try:
+        conn = await aiosqlite.connect(path)
+        try:
+            cur = await conn.execute("PRAGMA integrity_check")
+            row = await cur.fetchone()
+            if not row or row[0] != "ok":
+                return False, "fayl buzilgan yoki noto'g'ri SQLite bazasi (integrity_check xato)"
+            cur = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            rows = await cur.fetchall()
+            table_names = {r[0] for r in rows}
+            required = {"users", "anime", "episodes", "genres", "settings"}
+            missing = required - table_names
+            if missing:
+                return False, f"kerakli jadvallar topilmadi: {', '.join(sorted(missing))}"
+        finally:
+            await conn.close()
+        return True, ""
+    except Exception as e:
+        return False, f"fayl SQLite bazasi sifatida ochilmadi ({e})"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +141,8 @@ CREATE TABLE IF NOT EXISTS pending_payments (
 CREATE TABLE IF NOT EXISTS required_channels (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id     TEXT NOT NULL UNIQUE,   -- @username yoki -100...
-    title       TEXT
+    title       TEXT,
+    invite_link TEXT                   -- -100... ID orqali qo'shilgan kanallar uchun avtomatik yaratilgan taklif linki
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -164,8 +191,17 @@ class Database:
         await self.conn.execute("PRAGMA foreign_keys=ON;")
         await self.conn.executescript(SCHEMA)
         await self.conn.commit()
+        await self._migrate()
         await self._seed_defaults()
         logger.info("Baza ulandi: %s", self.path)
+
+    async def _migrate(self) -> None:
+        """Eski (allaqachon deploy qilingan) bazalarga yangi ustunlarni xavfsiz qo'shadi."""
+        cur = await self.conn.execute("PRAGMA table_info(required_channels)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "invite_link" not in cols:
+            await self.conn.execute("ALTER TABLE required_channels ADD COLUMN invite_link TEXT")
+            await self.conn.commit()
 
     async def close(self) -> None:
         if self.conn:
@@ -213,6 +249,25 @@ class Database:
         shutil.copyfile(self.path, dest)
         logger.info("Backup yaratildi: %s", dest)
         return dest
+
+    async def replace_with(self, new_db_path: str) -> None:
+        """
+        Joriy bazani berilgan fayl bilan TO'LIQ almashtiradi (zaxiradan tiklash uchun):
+        ulanishni to'g'ri yopadi (WAL checkpoint bo'lishi uchun), eski -wal/-shm
+        qoldiqlarini tozalaydi, faylni ko'chiradi va qayta ulanadi.
+        """
+        if self.conn:
+            await self.conn.commit()
+            await self.conn.close()
+        for suffix in ("-wal", "-shm"):
+            stale = self.path + suffix
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+        shutil.copyfile(new_db_path, self.path)
+        await self.connect()
 
     # ------------------------------------------------------------------ #
     # Settings (key-value)
@@ -317,6 +372,32 @@ class Database:
             )
             await self.conn.commit()
         return ids
+
+    async def revoke_vip(self, telegram_id: int) -> None:
+        """Foydalanuvchining VIP holatini adminlik qaroriga ko'ra darhol bekor qiladi."""
+        await self.conn.execute(
+            "UPDATE users SET vip_until=NULL WHERE telegram_id=?", (telegram_id,)
+        )
+        await self.conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # VIP'ni vaqtincha hammaga bepul qilish (promo rejim)
+    # ------------------------------------------------------------------ #
+    async def get_vip_free_until(self) -> Optional[datetime.datetime]:
+        raw = await self.get_setting("vip_free_until", "")
+        if not raw:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    async def set_vip_free_until(self, dt: Optional[datetime.datetime]) -> None:
+        await self.set_setting("vip_free_until", dt.isoformat(timespec="seconds") if dt else "")
+
+    async def is_vip_free_mode(self) -> bool:
+        until = await self.get_vip_free_until()
+        return bool(until and until > datetime.datetime.utcnow())
 
     async def count_users(self) -> int:
         cur = await self.conn.execute("SELECT COUNT(*) FROM users")
@@ -656,10 +737,16 @@ class Database:
         cur = await self.conn.execute("SELECT * FROM required_channels ORDER BY id")
         return await cur.fetchall()
 
-    async def add_required_channel(self, chat_id: str, title: str) -> None:
+    async def add_required_channel(self, chat_id: str, title: str, invite_link: Optional[str] = None) -> None:
         await self.conn.execute(
-            "INSERT OR IGNORE INTO required_channels (chat_id, title) VALUES (?,?)",
-            (chat_id, title),
+            "INSERT OR IGNORE INTO required_channels (chat_id, title, invite_link) VALUES (?,?,?)",
+            (chat_id, title, invite_link),
+        )
+        await self.conn.commit()
+
+    async def set_channel_invite_link(self, channel_pk: int, invite_link: str) -> None:
+        await self.conn.execute(
+            "UPDATE required_channels SET invite_link=? WHERE id=?", (invite_link, channel_pk)
         )
         await self.conn.commit()
 

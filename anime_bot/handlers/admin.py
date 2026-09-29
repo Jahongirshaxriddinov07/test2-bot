@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import math
+import os
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -13,7 +15,7 @@ from aiogram.types import CallbackQuery, Message
 
 import config
 import keyboards as kb
-from database import Database
+from database import Database, validate_sqlite_backup
 from handlers import user as user_handlers
 from handlers.common import IsAdminFilter, ensure_user, fmt_number
 from states import AddAnimeStates, AddEpisodeStates, AdminTextStates, BroadcastStates, EditAnimeStates
@@ -36,18 +38,32 @@ _broadcast_flags: dict[int, dict] = {}
 # va admin hech qachon "Iltimos ... yuboring" degan holatda qolib
 # ketmaydi, hatto /start yoki /cancel yozsa ham).
 # ------------------------------------------------------------------ #
+async def _cleanup_restore_tmp(state: FSMContext) -> None:
+    """Agar restore fayli yuklab olingan, lekin tasdiqlanmagan bo'lsa — diskdan tozalaydi."""
+    data = await state.get_data()
+    tmp_path = data.get("restore_tmp_path")
+    if tmp_path and os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 @router.message(F.text == "❌ Bekor qilish")
 async def admin_cancel_any(message: Message, state: FSMContext, db: Database):
+    await _cleanup_restore_tmp(state)
     await user_handlers.cancel_any(message, db, state)
 
 
 @router.message(Command("cancel"))
 async def admin_cancel_command(message: Message, state: FSMContext, db: Database):
+    await _cleanup_restore_tmp(state)
     await user_handlers.cancel_any(message, db, state)
 
 
 @router.message(CommandStart())
 async def admin_start_override(message: Message, state: FSMContext, db: Database):
+    await _cleanup_restore_tmp(state)
     await user_handlers.cmd_start(message, db, state)
 
 
@@ -485,13 +501,11 @@ async def admin_users_list(call: CallbackQuery, db: Database):
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("adm:user:"))
-async def admin_user_detail(call: CallbackQuery, db: Database):
-    telegram_id = int(call.data.split(":")[2])
+async def _render_user_detail_card(db: Database, telegram_id: int):
+    """Foydalanuvchi kartochkasi matni va tugmalarini tayyorlaydi (qayta ishlatish uchun)."""
     user = await db.get_user(telegram_id)
     if not user:
-        await call.answer("Topilmadi.", show_alert=True)
-        return
+        return None, None
     is_vip = await db.is_vip(telegram_id)
     favs = await db.list_favorites(telegram_id)
     history = await db.list_watch_history(telegram_id, limit=1000)
@@ -515,7 +529,18 @@ async def admin_user_detail(call: CallbackQuery, db: Database):
         f"📚 Ko'rilganlar: {len(history)} ta\n"
         f"📅 Qo'shilgan: {user['joined_at'][:10]}"
     )
-    await call.message.answer(text, reply_markup=kb.admin_user_detail_keyboard(telegram_id, bool(user["is_admin"])))
+    markup = kb.admin_user_detail_keyboard(telegram_id, bool(user["is_admin"]), is_vip)
+    return text, markup
+
+
+@router.callback_query(F.data.startswith("adm:user:"))
+async def admin_user_detail(call: CallbackQuery, db: Database):
+    telegram_id = int(call.data.split(":")[2])
+    text, markup = await _render_user_detail_card(db, telegram_id)
+    if text is None:
+        await call.answer("Topilmadi.", show_alert=True)
+        return
+    await call.message.answer(text, reply_markup=markup)
     await call.answer()
 
 
@@ -523,6 +548,12 @@ async def admin_user_detail(call: CallbackQuery, db: Database):
 async def make_admin(call: CallbackQuery, db: Database):
     telegram_id = int(call.data.split(":")[2])
     await db.set_admin(telegram_id, True)
+    text, markup = await _render_user_detail_card(db, telegram_id)
+    if text is not None:
+        try:
+            await call.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await call.message.answer(text, reply_markup=markup)
     await call.answer("✅ Admin qilindi.", show_alert=True)
 
 
@@ -530,7 +561,35 @@ async def make_admin(call: CallbackQuery, db: Database):
 async def revoke_admin(call: CallbackQuery, db: Database):
     telegram_id = int(call.data.split(":")[2])
     await db.set_admin(telegram_id, False)
+    text, markup = await _render_user_detail_card(db, telegram_id)
+    if text is not None:
+        try:
+            await call.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await call.message.answer(text, reply_markup=markup)
     await call.answer("✅ Admin huquqi olib tashlandi.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("adm:revoke_vip:"))
+async def revoke_vip_cb(call: CallbackQuery, db: Database, bot: Bot):
+    telegram_id = int(call.data.split(":")[2])
+    was_vip = await db.is_vip(telegram_id)
+    await db.revoke_vip(telegram_id)
+    if was_vip:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "❌ 💎 VIP obunangiz administrator tomonidan bekor qilindi.",
+            )
+        except Exception:
+            pass
+    text, markup = await _render_user_detail_card(db, telegram_id)
+    if text is not None:
+        try:
+            await call.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            await call.message.answer(text, reply_markup=markup)
+    await call.answer("✅ VIP bekor qilindi." if was_vip else "Bu foydalanuvchi allaqachon VIP emas edi.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("adm:grant_vip_menu:"))
@@ -839,16 +898,42 @@ async def add_channel_start(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(AdminTextStates.waiting_required_channel)
-async def add_channel_save(message: Message, state: FSMContext, db: Database):
+async def add_channel_save(message: Message, state: FSMContext, db: Database, bot: Bot):
     if not message.text:
         await message.answer("✏️ Iltimos, matn yuboring. Format: @kanal | Kanal nomi")
         return
     parts = message.text.split("|", 1)
     chat_id = parts[0].strip()
     title = parts[1].strip() if len(parts) > 1 else chat_id
-    await db.add_required_channel(chat_id, title)
+
+    invite_link = None
+    is_numeric_id = chat_id.lstrip("-").isdigit()
+
+    if is_numeric_id:
+        # Username emas, ID orqali qo'shilmoqda — "Kanalga o'tish" tugmasi ishlashi uchun
+        # bot haqiqiy taklif (invite) linkini o'zi yaratib olishga harakat qiladi
+        # (chunki -100... ID'dan https://t.me/... link to'g'ridan-to'g'ri yasab bo'lmaydi).
+        try:
+            link_obj = await bot.create_chat_invite_link(chat_id=chat_id, name=title[:32])
+            invite_link = link_obj.invite_link
+        except Exception as e:
+            logger.warning("Kanal uchun invite link yaratib bo'lmadi (%s): %s", chat_id, e)
+
+    await db.add_required_channel(chat_id, title, invite_link)
     await state.clear()
-    await message.answer("✅ Kanal qo'shildi.", reply_markup=kb.main_menu(is_admin=True))
+
+    if is_numeric_id and not invite_link:
+        await message.answer(
+            "⚠️ Kanal ID orqali saqlandi, lekin taklif linkini avtomatik yaratib bo'lmadi.\n\n"
+            "Sabab: botni ushbu kanalga <b>administrator</b> qilib qo'shmagan bo'lishingiz mumkin "
+            "(kamida \"Foydalanuvchilarni taklif qilish\" huquqi bilan).\n\n"
+            "Obuna tekshiruvi (kim obuna, kim emas) baribir to'g'ri ishlayveradi, lekin "
+            "foydalanuvchiga \"Kanalga o'tish\" tugmasi ko'rinmaydi. Buni tuzatish uchun: "
+            "botni kanalga admin qiling, so'ng bu kanalni o'chirib qayta qo'shing.",
+            reply_markup=kb.main_menu(is_admin=True),
+        )
+    else:
+        await message.answer("✅ Kanal qo'shildi.", reply_markup=kb.main_menu(is_admin=True))
     await message.answer("⚙️ Admin panel:", reply_markup=kb.admin_panel_menu())
 
 
@@ -864,10 +949,55 @@ async def del_channel(call: CallbackQuery, db: Database):
     await call.answer("O'chirildi.")
 
 
+@router.callback_query(F.data == "adm:vip_free_menu")
+async def vip_free_menu_open(call: CallbackQuery, db: Database):
+    until = await db.get_vip_free_until()
+    active = bool(until and until > datetime.datetime.utcnow())
+    text = "🎁 <b>VIP'ni vaqtincha bepul qilish</b>\n\n"
+    if active:
+        text += (
+            f"✅ Hozir faol: <b>{until.strftime('%Y-%m-%d %H:%M')}</b> (UTC) gacha "
+            f"barcha foydalanuvchilar VIP animelarni BEPUL tomosha qilishi mumkin.\n\n"
+        )
+    else:
+        text += "Hozir faol emas. Muddatni tanlang — shu vaqt davomida BARCHA foydalanuvchilar uchun VIP animelar bepul bo'ladi:\n\n"
+    await call.message.answer(text, reply_markup=kb.vip_free_menu(active))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:vip_free_set:"))
+async def vip_free_set(call: CallbackQuery, db: Database):
+    days = int(call.data.split(":")[2])
+    until = datetime.datetime.utcnow() + datetime.timedelta(days=days)
+    await db.set_vip_free_until(until)
+    await call.message.answer(
+        f"✅ Faollashtirildi! VIP animelar <b>{until.strftime('%Y-%m-%d %H:%M')}</b> (UTC) gacha "
+        f"barcha foydalanuvchilar uchun BEPUL bo'ladi.",
+        reply_markup=kb.admin_panel_menu(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm:vip_free_stop")
+async def vip_free_stop(call: CallbackQuery, db: Database):
+    await db.set_vip_free_until(None)
+    await call.message.answer("🛑 Bepul VIP rejimi to'xtatildi.", reply_markup=kb.admin_panel_menu())
+    await call.answer()
+
+
 # ------------------------------------------------------------------ #
-# Backup
+# Backup (zaxira olish / tiklash)
 # ------------------------------------------------------------------ #
-@router.callback_query(F.data == "adm:backup")
+@router.callback_query(F.data == "adm:backup_menu")
+async def backup_menu_open(call: CallbackQuery):
+    await call.message.answer(
+        "💾 <b>Zaxira nusxa</b>\n\nQuyidagilardan birini tanlang:",
+        reply_markup=kb.backup_menu(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm:backup_export")
 async def do_backup(call: CallbackQuery, db: Database):
     path = await db.backup()
     try:
@@ -876,6 +1006,112 @@ async def do_backup(call: CallbackQuery, db: Database):
     except Exception:
         await call.message.answer(f"💾 Zaxira nusxa yaratildi: {path}")
     await call.answer()
+
+
+@router.callback_query(F.data == "adm:backup_import")
+async def backup_import_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminTextStates.waiting_backup_file)
+    await call.message.answer(
+        "📥 <b>Zaxiradan tiklash</b>\n\n"
+        "⚠️ Diqqat: bu amal joriy bazadagi barcha ma'lumotlarni yuboradigan "
+        "faylingizdagi ma'lumotlar bilan <b>to'liq almashtiradi</b>. "
+        "Ehtiyot chorasi sifatida joriy baza avtomatik ravishda zaxiralanadi, "
+        "shuning uchun xato bo'lsa ham hech narsa butunlay yo'qolmaydi.\n\n"
+        "\"💾 Zaxira olish\" orqali oldin saqlangan <code>.db</code> faylni "
+        "shu yerga hujjat (document) sifatida yuboring:",
+        reply_markup=kb.cancel_menu(),
+    )
+    await call.answer()
+
+
+@router.message(AdminTextStates.waiting_backup_file, F.document)
+async def backup_import_receive(message: Message, state: FSMContext, bot: Bot):
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".db"):
+        await message.answer(
+            "❗ Fayl kengaytmasi <code>.db</code> bo'lishi kerak. "
+            "Boshqa fayl yuboring yoki ❌ Bekor qilish tugmasini bosing."
+        )
+        return
+
+    status_msg = await message.answer("⏳ Fayl tekshirilmoqda...")
+
+    os.makedirs(config.BACKUP_DIR, exist_ok=True)
+    tmp_path = os.path.join(config.BACKUP_DIR, f"_restore_{message.from_user.id}_{doc.file_unique_id}.db")
+    file = await bot.get_file(doc.file_id)
+    await bot.download_file(file.file_path, destination=tmp_path)
+
+    ok, err = await validate_sqlite_backup(tmp_path)
+    if not ok:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        await status_msg.edit_text(
+            f"❌ Fayl yaroqsiz: {err}\n\nBoshqa fayl yuboring yoki ❌ Bekor qilish tugmasini bosing."
+        )
+        return
+
+    await state.update_data(restore_tmp_path=tmp_path)
+    await status_msg.edit_text(
+        "✅ Fayl to'g'ri SQLite baza ekan.\n\n"
+        "‼️ <b>So'nggi tasdiq</b>: hozirgi baza avtomatik zaxiralab qo'yiladi, "
+        "so'ngra u shu fayl bilan to'liq almashtiriladi. Davom etasizmi?"
+    )
+    await message.answer("Tanlang:", reply_markup=kb.confirm_restore_keyboard())
+
+
+@router.message(AdminTextStates.waiting_backup_file)
+async def backup_import_wrong_type(message: Message):
+    await message.answer(
+        "📥 Iltimos <code>.db</code> zaxira faylini hujjat (document) sifatida yuboring "
+        "(rasm yoki matn emas)."
+    )
+
+
+@router.callback_query(AdminTextStates.waiting_backup_file, F.data == "adm:backup_import_confirm")
+async def backup_import_confirm(call: CallbackQuery, state: FSMContext, db: Database):
+    data = await state.get_data()
+    tmp_path = data.get("restore_tmp_path")
+    await state.clear()
+
+    if not tmp_path or not os.path.exists(tmp_path):
+        await call.answer("❗ Fayl topilmadi, jarayonni qaytadan boshlang.", show_alert=True)
+        return
+
+    await call.answer()
+    await call.message.answer("⏳ Baza tiklanmoqda, biroz kuting...")
+    try:
+        await db.backup()  # joriy holatni xavfsizlik uchun avval zaxiralaymiz
+        await db.replace_with(tmp_path)
+    except Exception as e:
+        logger.exception("Bazani tiklashda xatolik")
+        await call.message.answer(f"❌ Tiklashda xatolik yuz berdi: {e}")
+        return
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    await call.message.answer(
+        "✅ Baza muvaffaqiyatli tiklandi!",
+        reply_markup=kb.admin_panel_menu(),
+    )
+
+
+@router.callback_query(F.data == "adm:backup_import_cancel")
+async def backup_import_cancel_cb(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tmp_path = data.get("restore_tmp_path")
+    await state.clear()
+    if tmp_path and os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    await call.answer("Bekor qilindi.", show_alert=True)
+    await call.message.answer("⚙️ Admin panel", reply_markup=kb.admin_panel_menu())
 
 
 # ------------------------------------------------------------------ #

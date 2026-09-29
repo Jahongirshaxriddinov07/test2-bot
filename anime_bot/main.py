@@ -18,6 +18,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 import config
 from database import Database
 from handlers import admin, user
+from handlers.common import SubscriptionMiddleware
 
 logger = logging.getLogger("anime_bot")
 
@@ -108,6 +109,10 @@ def main() -> None:
 
     # db obyektini barcha handlerlarga uzatamiz
     dp["db"] = db
+
+    # Har bir harakatda majburiy obunani qayta tekshiradigan middleware
+    dp.message.outer_middleware(SubscriptionMiddleware())
+    dp.callback_query.outer_middleware(SubscriptionMiddleware())
 
     dp.include_router(admin.router)
     dp.include_router(user.router)

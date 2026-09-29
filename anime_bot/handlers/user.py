@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 
@@ -11,13 +12,24 @@ from aiogram.exceptions import TelegramBadRequest
 
 import keyboards as kb
 from database import Database
-from handlers.common import ensure_user, fmt_number, is_subscribed_to_all
+from handlers.common import ensure_user, fmt_number, has_vip_access, is_subscribed_to_all
 from states import SearchStates, VipPaymentStates
 
 logger = logging.getLogger("anime_bot.user")
 router = Router(name="user")
 
 PER_PAGE = 10
+
+
+async def _vip_free_banner(db: Database) -> str:
+    """Agar hozir vaqtinchalik 'VIP hammaga bepul' rejimi faol bo'lsa, banner matnini qaytaradi."""
+    until = await db.get_vip_free_until()
+    if until and until > datetime.datetime.utcnow():
+        return (
+            f"🎁 <b>E'lon:</b> hozirda VIP animelarni ham BEPUL tomosha qilishingiz mumkin! "
+            f"({until.strftime('%d.%m.%Y')} kungacha)\n\n"
+        )
+    return ""
 
 
 # ------------------------------------------------------------------ #
@@ -91,9 +103,10 @@ async def back_to_user_panel(message: Message, db: Database):
 # Qidiruv
 # ------------------------------------------------------------------ #
 @router.message(F.text == "🔎 Anime qidirish")
-async def search_entry(message: Message, state: FSMContext):
+async def search_entry(message: Message, state: FSMContext, db: Database):
     await state.clear()
-    await message.answer("Qidiruv turini tanlang:", reply_markup=kb.search_menu())
+    banner = await _vip_free_banner(db)
+    await message.answer(f"{banner}Qidiruv turini tanlang:", reply_markup=kb.search_menu())
 
 
 @router.callback_query(F.data == "search:title")
@@ -184,13 +197,15 @@ async def popular_anime(message: Message, db: Database):
 @router.message(F.text == "📚 Katalog")
 async def catalog(message: Message, db: Database):
     genres = await db.list_genres()
-    await message.answer("📚 Janr bo'yicha katalog. Janrni tanlang:", reply_markup=kb.genres_menu(genres))
+    banner = await _vip_free_banner(db)
+    await message.answer(f"{banner}📚 Janr bo'yicha katalog. Janrni tanlang:", reply_markup=kb.genres_menu(genres))
 
 
 @router.message(F.text == "🎭 Janrlar")
 async def genres_list(message: Message, db: Database):
     genres = await db.list_genres()
-    await message.answer("🎭 Janrni tanlang:", reply_markup=kb.genres_menu(genres))
+    banner = await _vip_free_banner(db)
+    await message.answer(f"{banner}🎭 Janrni tanlang:", reply_markup=kb.genres_menu(genres))
 
 
 @router.callback_query(F.data.startswith("search_genre:"))
@@ -200,7 +215,7 @@ async def genre_selected(call: CallbackQuery, db: Database, state: FSMContext):
     if not genre:
         await call.answer("Janr topilmadi.", show_alert=True)
         return
-    if genre["is_vip"] and not await db.is_vip(call.from_user.id):
+    if genre["is_vip"] and not await has_vip_access(db, call.from_user.id):
         await call.answer(
             "💎 Bu VIP janr. Ko'rish uchun VIP obuna kerak (👤 Profil → 💎 VIP olish).",
             show_alert=True,
@@ -277,7 +292,7 @@ async def show_anime_detail(message: Message, db: Database, anime_id: int, viewe
         await message.answer("Bu anime topilmadi (o'chirilgan bo'lishi mumkin).")
         return
 
-    if anime["is_vip"] and not await db.is_vip(viewer_telegram_id):
+    if anime["is_vip"] and not await has_vip_access(db, viewer_telegram_id):
         text = (
             f"💎 <b>{anime['title']}</b>\n\n"
             "Bu anime VIP foydalanuvchilar uchun mo'ljallangan.\n"
@@ -396,7 +411,7 @@ async def show_episodes(call: CallbackQuery, db: Database):
     if not anime:
         await call.answer("Anime topilmadi.", show_alert=True)
         return
-    if anime["is_vip"] and not await db.is_vip(call.from_user.id):
+    if anime["is_vip"] and not await has_vip_access(db, call.from_user.id):
         await call.answer("💎 Bu VIP anime. Ko'rish uchun VIP kerak.", show_alert=True)
         return
     total = await db.count_episodes(anime_id)
@@ -421,7 +436,7 @@ async def watch_episode(call: CallbackQuery, db: Database, bot: Bot):
         await call.answer("Video topilmadi.", show_alert=True)
         return
     anime = await db.get_anime(episode["anime_id"])
-    if anime["is_vip"] and not await db.is_vip(call.from_user.id):
+    if anime["is_vip"] and not await has_vip_access(db, call.from_user.id):
         await call.answer("💎 Bu VIP anime. Ko'rish uchun VIP kerak.", show_alert=True)
         return
 

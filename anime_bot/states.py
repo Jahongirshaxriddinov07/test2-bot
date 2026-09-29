@@ -44,3 +44,4 @@ class AdminTextStates(StatesGroup):
     waiting_required_channel = State()
     waiting_grant_vip_search = State()
     waiting_user_search = State()
+    waiting_backup_file = State()
