@@ -1,4 +1,4 @@
-"""Test2 Bot — barcha klaviaturalar (reply va inline) shu yerda to'plangan."""
+ """Test2 Bot — barcha klaviaturalar (reply va inline) shu yerda to'plangan."""
 from __future__ import annotations
 
 import math
@@ -253,7 +253,7 @@ def admin_panel_menu() -> InlineKeyboardMarkup:
     b.button(text="🖼 /start rasm/matn", callback_data="adm:start_settings")
     b.button(text="🆘 Yordam matni", callback_data="adm:help_settings")
     b.button(text="💾 Zaxira nusxa (Backup)", callback_data="adm:backup_menu")
-    b.adjust(1)
+    b.adjust(2)
     return b.as_markup()
 
 
