@@ -1,4 +1,4 @@
- """Test2 Bot — barcha klaviaturalar (reply va inline) shu yerda to'plangan."""
+"""Test2 Bot — barcha klaviaturalar (reply va inline) shu yerda to'plangan."""
 from __future__ import annotations
 
 import math
