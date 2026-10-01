@@ -140,6 +140,11 @@ def main() -> None:
 
     app = web.Application()
 
+    async def health(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app.router.add_get("/health", health)
+
     # Aiogram tayyor webhook ishlovchisi
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
