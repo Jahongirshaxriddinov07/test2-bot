@@ -21,8 +21,9 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="🔎 Anime qidirish")],
         [KeyboardButton(text="📚 Katalog"), KeyboardButton(text="🆕 Yangi animelar")],
-        [KeyboardButton(text="🔥 Mashhur animelar"), KeyboardButton(text="❤️ Sevimlilar")],
-        [KeyboardButton(text="📚 Ko'rish tarixi"), KeyboardButton(text="🎭 Janrlar")],
+        [KeyboardButton(text="🔥 Mashhur animelar"), KeyboardButton(text="🔥 Yangi qismlar")],
+        [KeyboardButton(text="❤️ Sevimlilar"), KeyboardButton(text="🎭 Janrlar")],
+        [KeyboardButton(text="🕐 Ko'rish tarixi"), KeyboardButton(text="🎲 Tasodifiy anime")],
         [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🆘 Yordam")],
     ]
     if is_admin:
@@ -114,14 +115,72 @@ def anime_list_keyboard(anime_rows, page: int, total_pages: int, list_kind: str)
     return b.as_markup()
 
 
-def anime_detail_keyboard(anime_id: int, is_favorite: bool, has_rated: bool) -> InlineKeyboardMarkup:
+def anime_detail_keyboard(anime_id: int, is_favorite: bool, is_following: bool, has_seasons: bool = False) -> InlineKeyboardMarkup:
+    """
+    Eslatma: "⭐ Baholash" tugmasi endi bu yerda YO'Q — u endi foydalanuvchi biror
+    qismni ochib ko'rgandan KEYIN chiqadi (qarang: post_watch_rate_keyboard).
+    """
     b = InlineKeyboardBuilder()
-    b.button(text="▶️ Qismlarni ko'rish", callback_data=f"episodes:{anime_id}:0")
+    if has_seasons:
+        b.button(text="🎬 Fasllarni ko'rish", callback_data=f"seasons:{anime_id}")
+    else:
+        b.button(text="▶️ Qismlarni ko'rish", callback_data=f"episodes:{anime_id}:0:0")
     fav_text = "💔 Sevimlilardan olib tashlash" if is_favorite else "❤️ Sevimlilarga qo'shish"
     b.button(text=fav_text, callback_data=f"fav:{anime_id}")
-    if not has_rated:
-        b.button(text="⭐ Baholash", callback_data=f"rate_open:{anime_id}")
+    follow_text = "🔕 Kuzatishni to'xtatish" if is_following else "🔔 Kuzatish"
+    b.button(text=follow_text, callback_data=f"follow:{anime_id}")
     b.adjust(1)
+    return b.as_markup()
+
+
+def post_watch_rate_keyboard(anime_id: int) -> InlineKeyboardMarkup:
+    """Qism yuborilgandan keyin chiqadigan yagona '⭐ Baholash' tugmasi."""
+    b = InlineKeyboardBuilder()
+    b.button(text="⭐ Baholash", callback_data=f"rate_open:{anime_id}")
+    return b.as_markup()
+
+
+def seasons_keyboard(anime_id: int, seasons) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for s in seasons:
+        b.button(
+            text=f"📁 {s['season_number']}-fasl ({s['episode_count']} qism)",
+            callback_data=f"episodes:{anime_id}:{s['id']}:0",
+        )
+    b.adjust(1)
+    b.row(InlineKeyboardButton(text="⬅️ Anime sahifasiga", callback_data=f"anime:{anime_id}"))
+    return b.as_markup()
+
+
+def continue_watching_keyboard(anime_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="▶️ Davom ettirish", callback_data=f"continue_watch:{anime_id}")
+    return b.as_markup()
+
+
+def history_keyboard(rows) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for r in rows:
+        b.button(text=f"▶️ {r['title']}", callback_data=f"continue_watch:{r['id']}")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def recent_episodes_keyboard(rows) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for r in rows:
+        season_txt = f" {r['season_number']}-fasl," if r["season_number"] else ""
+        b.button(
+            text=f"🔥 {r['anime_title']}{season_txt} {r['episode_number']}-qism",
+            callback_data=f"watch:{r['id']}",
+        )
+    b.adjust(1)
+    return b.as_markup()
+
+
+def new_episode_notify_keyboard(episode_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="▶️ Ko'rish", callback_data=f"watch:{episode_id}")
     return b.as_markup()
 
 
@@ -144,7 +203,8 @@ def episode_upload_keyboard() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def episodes_keyboard(anime_id: int, episodes, page: int, total_episodes: int) -> InlineKeyboardMarkup:
+def episodes_keyboard(anime_id: int, episodes, page: int, total_episodes: int, season_token: str = "0") -> InlineKeyboardMarkup:
+    """season_token: "0" = fasllarsiz (oddiy) anime, aks holda season_id (str)."""
     b = InlineKeyboardBuilder()
     for ep in episodes:
         b.button(text=str(ep["episode_number"]), callback_data=f"watch:{ep['id']}")
@@ -154,11 +214,13 @@ def episodes_keyboard(anime_id: int, episodes, page: int, total_episodes: int) -
     if total_pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"episodes:{anime_id}:{page-1}"))
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"episodes:{anime_id}:{season_token}:{page-1}"))
         nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
         if page < total_pages - 1:
-            nav.append(InlineKeyboardButton(text="🔜", callback_data=f"episodes:{anime_id}:{page+1}"))
+            nav.append(InlineKeyboardButton(text="🔜", callback_data=f"episodes:{anime_id}:{season_token}:{page+1}"))
         b.row(*nav)
+    if season_token != "0":
+        b.row(InlineKeyboardButton(text="⬅️ Fasllar", callback_data=f"seasons:{anime_id}"))
     b.row(InlineKeyboardButton(text="⬅️ Anime sahifasiga", callback_data=f"anime:{anime_id}"))
     return b.as_markup()
 
@@ -243,6 +305,7 @@ def admin_panel_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="➕ Anime qo'shish", callback_data="adm:add_anime")
     b.button(text="🎬 Animelar ro'yxati", callback_data="adm:anime_list:0")
+    b.button(text="📚 Mavjud animega fasl qo'shish", callback_data="adm:season_pick:0")
     b.button(text="👥 Foydalanuvchilar", callback_data="adm:users:0")
     b.button(text="📊 Statistika", callback_data="adm:stats")
     b.button(text="📢 Reklama", callback_data="adm:broadcast")
@@ -339,15 +402,56 @@ def admin_anime_list_keyboard(anime_rows, page: int, total_pages: int) -> Inline
     return b.as_markup()
 
 
-def admin_anime_detail_keyboard(anime_id: int) -> InlineKeyboardMarkup:
+def admin_anime_detail_keyboard(anime_id: int, has_seasons: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="➕ Qism qo'shish (video yuborish)", callback_data=f"adm:add_episode:{anime_id}")
+    if has_seasons:
+        b.button(text="📚 Fasllarni boshqarish", callback_data=f"adm:seasons_of:{anime_id}")
+    else:
+        b.button(text="➕ Qism qo'shish (video yuborish)", callback_data=f"adm:add_episode:{anime_id}")
     b.button(text="✏️ Nomi", callback_data=f"adm:edit_title:{anime_id}")
     b.button(text="✏️ Tavsifi", callback_data=f"adm:edit_desc:{anime_id}")
     b.button(text="🎭 Janrlarni o'zgartirish", callback_data=f"adm:edit_genres:{anime_id}")
     b.button(text="📢 Kanalga e'lon qilish", callback_data=f"adm:announce:{anime_id}")
     b.button(text="🗑 O'chirish", callback_data=f"adm:delete_anime_confirm:{anime_id}")
     b.button(text="⬅️ Orqaga", callback_data="adm:anime_list:0")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_pick_anime_for_season_keyboard(anime_rows, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for a in anime_rows:
+        b.button(text=f"{a['title']} (ID:{a['anime_code']})", callback_data=f"adm:season_pick_anime:{a['id']}")
+    b.adjust(1)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:season_pick:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="🔜", callback_data=f"adm:season_pick:{page+1}"))
+    if total_pages > 1:
+        b.row(*nav)
+    b.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm:panel"))
+    return b.as_markup()
+
+
+def admin_seasons_keyboard(anime_id: int, seasons) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for s in seasons:
+        b.button(
+            text=f"📁 {s['season_number']}-fasl ({s['episode_count']} qism)",
+            callback_data=f"adm:season:{s['id']}",
+        )
+    b.adjust(1)
+    b.row(InlineKeyboardButton(text="➕ Yangi fasl qo'shish", callback_data=f"adm:add_season:{anime_id}"))
+    b.row(InlineKeyboardButton(text="⬅️ Anime sahifasiga", callback_data=f"adm:anime:{anime_id}"))
+    return b.as_markup()
+
+
+def admin_season_detail_keyboard(season_id: int, anime_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Qism qo'shish", callback_data=f"adm:add_episode_season:{season_id}")
+    b.button(text="⬅️ Fasllarga qaytish", callback_data=f"adm:seasons_of:{anime_id}")
     b.adjust(1)
     return b.as_markup()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import logging
 import math
+import random
 
 from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart
@@ -61,6 +62,20 @@ async def cmd_start(message: Message, db: Database, state: FSMContext):
             return
 
     await _send_start_message(message, db, is_admin=bool(user["is_admin"]))
+    await _maybe_show_continue_watching(message, db, message.from_user.id)
+
+
+async def _maybe_show_continue_watching(message: Message, db: Database, telegram_id: int) -> None:
+    """Agar foydalanuvchi ilgari biror anime ko'rgan bo'lsa, davom ettirish taklifini ko'rsatadi."""
+    progress = await db.get_continue_watching(telegram_id)
+    if not progress:
+        return
+    season_txt = f" {progress['season_number']}-fasl," if progress["season_number"] else ""
+    text = (
+        f"▶️ <b>Ko'rishni davom ettirish</b>\n\n"
+        f"🎬 {progress['title']} —{season_txt} {progress['episode_number']}-qismdan keyin"
+    )
+    await message.answer(text, reply_markup=kb.continue_watching_keyboard(progress["id"]))
 
 
 @router.callback_query(F.data == "noop")
@@ -90,6 +105,7 @@ async def check_subs(call: CallbackQuery, db: Database):
     user = await ensure_user(db, call.from_user)
     await call.message.delete()
     await _send_start_message(call.message, db, is_admin=bool(user["is_admin"]))
+    await _maybe_show_continue_watching(call.message, db, call.from_user.id)
     await call.answer("✅ Obuna tasdiqlandi!")
 
 
@@ -192,6 +208,34 @@ async def popular_anime(message: Message, db: Database):
     total_pages = max(1, math.ceil(await db.count_published_anime() / PER_PAGE))
     await message.answer("🔥 Mashhur animelar:",
                           reply_markup=kb.anime_list_keyboard(rows, 0, total_pages, "popular"))
+
+
+@router.message(F.text == "🔥 Yangi qismlar")
+async def recent_episodes(message: Message, db: Database):
+    """Oldindan mavjud animelarga yaqinda qo'shilgan qismlar (🆕 Yangi animelardan farqli)."""
+    rows = await db.list_recent_episodes(limit=50)
+    viewer_has_vip = await has_vip_access(db, message.from_user.id)
+    visible = [r for r in rows if viewer_has_vip or not r["anime_is_vip"]]
+    visible = visible[:PER_PAGE]
+    if not visible:
+        await message.answer("Hozircha yangi qism qo'shilmagan.")
+        return
+    await message.answer("🔥 Yaqinda qo'shilgan qismlar:", reply_markup=kb.recent_episodes_keyboard(visible))
+
+
+@router.message(F.text == "🎲 Tasodifiy anime")
+async def random_anime(message: Message, db: Database):
+    rows = await db.all_anime_for_random()
+    if not rows:
+        await message.answer("Hozircha anime qo'shilmagan.")
+        return
+    viewer_has_vip = await has_vip_access(db, message.from_user.id)
+    candidates = [a for a in rows if viewer_has_vip or not a["is_vip"]]
+    if not candidates:
+        candidates = rows  # hammasi VIP bo'lsa ham ko'rsatamiz — anime sahifasi o'zi bloklaydi
+    anime = random.choice(candidates)
+    await message.answer("🎲 Bugungi tasodifiy anime:")
+    await show_anime_detail(message, db, anime["id"], message.from_user.id)
 
 
 @router.message(F.text == "📚 Katalog")
@@ -306,23 +350,68 @@ async def show_anime_detail(message: Message, db: Database, anime_id: int, viewe
     avg, count = await db.anime_avg_rating(anime_id)
     ep_count = await db.count_episodes(anime_id)
     is_fav = await db.is_favorite(anime_id, viewer_telegram_id)
-    has_rated = await db.has_rated(anime_id, viewer_telegram_id)
+    is_following = await db.is_following(anime_id, viewer_telegram_id)
+    seasons = await db.list_seasons(anime_id)
+    has_seasons = bool(seasons)
 
     rating_txt = f"{avg}⭐ ({count} baho)" if count else "hali baholanmagan"
+    season_line = f"📁 Fasllar soni: {len(seasons)}\n" if has_seasons else ""
     caption = (
         f"🎬 <b>{anime['title']}</b>\n"
         f"🆔 ID: <code>{anime['anime_code']}</code>\n"
         f"🎭 Janr: {genre_txt}\n"
         f"⭐ Reyting: {rating_txt}\n"
+        f"{season_line}"
         f"📼 Qismlar soni: {ep_count}\n"
         f"{'💎 VIP anime' if anime['is_vip'] else ''}\n\n"
         f"{anime['description'] or ''}"
     )
-    markup = kb.anime_detail_keyboard(anime_id, is_fav, has_rated)
+    markup = kb.anime_detail_keyboard(anime_id, is_fav, is_following, has_seasons)
     if anime["poster_file_id"]:
         await message.answer_photo(anime["poster_file_id"], caption=caption, reply_markup=markup)
     else:
         await message.answer(caption, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("seasons:"))
+async def show_seasons(call: CallbackQuery, db: Database):
+    anime_id = int(call.data.split(":")[1])
+    anime = await db.get_anime(anime_id)
+    if not anime:
+        await call.answer("Anime topilmadi.", show_alert=True)
+        return
+    if anime["is_vip"] and not await has_vip_access(db, call.from_user.id):
+        await call.answer("💎 Bu VIP anime. Ko'rish uchun VIP kerak.", show_alert=True)
+        return
+    seasons = await db.list_seasons(anime_id)
+    if not seasons:
+        await call.answer("Fasllar topilmadi.", show_alert=True)
+        return
+    text = f"🎬 <b>{anime['title']}</b>\nFaslni tanlang:"
+    markup = kb.seasons_keyboard(anime_id, seasons)
+    try:
+        await call.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=markup)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("follow:"))
+async def toggle_follow_cb(call: CallbackQuery, db: Database):
+    anime_id = int(call.data.split(":")[1])
+    following = await db.toggle_follow(anime_id, call.from_user.id)
+    await call.answer("🔔 Kuzatishga qo'shildingiz." if following else "🔕 Kuzatish bekor qilindi.")
+    anime = await db.get_anime(anime_id)
+    if not anime:
+        return
+    is_fav = await db.is_favorite(anime_id, call.from_user.id)
+    seasons = await db.list_seasons(anime_id)
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=kb.anime_detail_keyboard(anime_id, is_fav, following, bool(seasons))
+        )
+    except TelegramBadRequest:
+        pass
 
 
 @router.callback_query(F.data.startswith("anime:"))
@@ -341,10 +430,15 @@ async def toggle_fav(call: CallbackQuery, db: Database):
     added = await db.toggle_favorite(anime_id, call.from_user.id)
     await call.answer("❤️ Sevimlilarga qo'shildi!" if added else "💔 Sevimlilardan olib tashlandi.")
     anime = await db.get_anime(anime_id)
+    if not anime:
+        return
     is_fav = await db.is_favorite(anime_id, call.from_user.id)
-    has_rated = await db.has_rated(anime_id, call.from_user.id)
+    is_following = await db.is_following(anime_id, call.from_user.id)
+    seasons = await db.list_seasons(anime_id)
     try:
-        await call.message.edit_reply_markup(reply_markup=kb.anime_detail_keyboard(anime_id, is_fav, has_rated))
+        await call.message.edit_reply_markup(
+            reply_markup=kb.anime_detail_keyboard(anime_id, is_fav, is_following, bool(seasons))
+        )
     except TelegramBadRequest:
         pass
 
@@ -366,13 +460,17 @@ async def favorites_menu(message: Message, db: Database):
 # ------------------------------------------------------------------ #
 # Ko'rish tarixi
 # ------------------------------------------------------------------ #
-@router.message(F.text == "📚 Ko'rish tarixi")
+@router.message(F.text == "🕐 Ko'rish tarixi")
 async def history_menu(message: Message, db: Database):
     rows = await db.list_watch_history(message.from_user.id, limit=PER_PAGE)
     if not rows:
-        await message.answer("📚 Ko'rish tarixingiz hozircha bo'sh.")
+        await message.answer("🕐 Ko'rish tarixingiz hozircha bo'sh.")
         return
-    await message.answer("📚 Oxirgi ko'rgan animelaringiz:", reply_markup=kb.anime_list_keyboard(rows, 0, 1, "history"))
+    lines = ["🕐 <b>Ko'rish tarixi</b>\n"]
+    for r in rows:
+        season_txt = f" {r['season_number']}-fasl," if r["season_number"] else ""
+        lines.append(f"🎬 {r['title']} —{season_txt} {r['episode_number']}-qism")
+    await message.answer("\n".join(lines), reply_markup=kb.history_keyboard(rows))
 
 
 # ------------------------------------------------------------------ #
@@ -405,8 +503,9 @@ async def rate_submit(call: CallbackQuery, db: Database):
 # ------------------------------------------------------------------ #
 @router.callback_query(F.data.startswith("episodes:"))
 async def show_episodes(call: CallbackQuery, db: Database):
-    _, anime_id_str, page_str = call.data.split(":")
+    _, anime_id_str, season_token, page_str = call.data.split(":")
     anime_id, page = int(anime_id_str), int(page_str)
+    season_id = None if season_token == "0" else int(season_token)
     anime = await db.get_anime(anime_id)
     if not anime:
         await call.answer("Anime topilmadi.", show_alert=True)
@@ -414,18 +513,45 @@ async def show_episodes(call: CallbackQuery, db: Database):
     if anime["is_vip"] and not await has_vip_access(db, call.from_user.id):
         await call.answer("💎 Bu VIP anime. Ko'rish uchun VIP kerak.", show_alert=True)
         return
-    total = await db.count_episodes(anime_id)
+    total = await db.count_episodes_in_season(anime_id, season_id)
     if total == 0:
         await call.answer("Hali qismlar qo'shilmagan.", show_alert=True)
         return
-    episodes = await db.list_episodes_page(anime_id, page)
-    text = f"🎬 <b>{anime['title']}</b>\nQism raqamini tanlang ({total} ta qism):"
-    markup = kb.episodes_keyboard(anime_id, episodes, page, total)
+    episodes = await db.list_episodes_page(anime_id, page, season_id)
+    season_label = ""
+    if season_id:
+        season = await db.get_season(season_id)
+        if season:
+            season_label = f" — {season['season_number']}-fasl"
+    text = f"🎬 <b>{anime['title']}</b>{season_label}\nQism raqamini tanlang ({total} ta qism):"
+    markup = kb.episodes_keyboard(anime_id, episodes, page, total, season_token)
     try:
         await call.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest:
         await call.message.answer(text, reply_markup=markup)
     await call.answer()
+
+
+async def _send_episode(db: Database, bot: Bot, telegram_id: int, anime, episode) -> None:
+    """Video yuborish + ko'rish tarixi/progressni saqlash + (kerak bo'lsa) baholash taklifi."""
+    season_txt = ""
+    season = await db.get_season(episode["season_id"]) if episode["season_id"] else None
+    if season:
+        season_txt = f" {season['season_number']}-fasl,"
+    await bot.send_video(
+        chat_id=telegram_id,
+        video=episode["video_file_id"],
+        caption=f"🎬 {anime['title']} —{season_txt} {episode['episode_number']}-qism",
+        protect_content=bool(anime["is_vip"]),
+    )
+    await db.log_watch(telegram_id, anime["id"], episode["id"])
+    await db.set_watch_progress(telegram_id, anime["id"], episode["id"])
+    if not await db.has_rated(anime["id"], telegram_id):
+        await bot.send_message(
+            telegram_id,
+            "Ushbu animeni baholashni unutmang 👇",
+            reply_markup=kb.post_watch_rate_keyboard(anime["id"]),
+        )
 
 
 @router.callback_query(F.data.startswith("watch:"))
@@ -436,17 +562,36 @@ async def watch_episode(call: CallbackQuery, db: Database, bot: Bot):
         await call.answer("Video topilmadi.", show_alert=True)
         return
     anime = await db.get_anime(episode["anime_id"])
+    if not anime:
+        await call.answer("Anime topilmadi.", show_alert=True)
+        return
     if anime["is_vip"] and not await has_vip_access(db, call.from_user.id):
         await call.answer("💎 Bu VIP anime. Ko'rish uchun VIP kerak.", show_alert=True)
         return
+    await _send_episode(db, bot, call.from_user.id, anime, episode)
+    await call.answer()
 
-    await bot.send_video(
-        chat_id=call.from_user.id,
-        video=episode["video_file_id"],
-        caption=f"🎬 {anime['title']} — {episode['episode_number']}-qism",
-        protect_content=bool(anime["is_vip"]),
-    )
-    await db.log_watch(call.from_user.id, anime["id"], episode["id"])
+
+@router.callback_query(F.data.startswith("continue_watch:"))
+async def continue_watch(call: CallbackQuery, db: Database, bot: Bot):
+    anime_id = int(call.data.split(":")[1])
+    anime = await db.get_anime(anime_id)
+    if not anime:
+        await call.answer("Anime topilmadi.", show_alert=True)
+        return
+    if anime["is_vip"] and not await has_vip_access(db, call.from_user.id):
+        await call.answer("💎 Bu VIP anime. Ko'rish uchun VIP kerak.", show_alert=True)
+        return
+    progress = await db.get_watch_progress_for_anime(call.from_user.id, anime_id)
+    if not progress:
+        await call.answer("Bu anime bo'yicha ko'rish tarixi topilmadi.", show_alert=True)
+        return
+    next_ep = await db.get_next_episode(anime_id, progress["episode_id"])
+    target_ep = next_ep or await db.get_episode(progress["episode_id"])
+    if not target_ep:
+        await call.answer("Qism topilmadi.", show_alert=True)
+        return
+    await _send_episode(db, bot, call.from_user.id, anime, target_ep)
     await call.answer()
 
 

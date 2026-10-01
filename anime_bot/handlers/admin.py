@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+from typing import Optional
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -234,15 +235,18 @@ async def admin_anime_detail(call: CallbackQuery, db: Database):
     genres = await db.get_anime_genres(anime_id)
     genre_txt = ", ".join(f"{g['emoji']} {g['name']}" for g in genres) or "—"
     ep_count = await db.count_episodes(anime_id)
+    seasons = await db.list_seasons(anime_id)
+    season_line = f"📁 Fasllar: {len(seasons)}\n" if seasons else ""
     text = (
         f"🎬 <b>{anime['title']}</b>\n"
         f"🆔 ID: <code>{anime['anime_code']}</code>\n"
         f"🎭 Janr: {genre_txt}\n"
+        f"{season_line}"
         f"📼 Qismlar: {ep_count}\n"
         f"{'💎 VIP' if anime['is_vip'] else '🆓 Oddiy'}\n\n"
         f"{anime['description'] or ''}"
     )
-    await call.message.answer(text, reply_markup=kb.admin_anime_detail_keyboard(anime_id))
+    await call.message.answer(text, reply_markup=kb.admin_anime_detail_keyboard(anime_id, bool(seasons)))
     await call.answer()
 
 
@@ -318,7 +322,10 @@ async def admin_edit_genres_pick(call: CallbackQuery, state: FSMContext, db: Dat
     if value == "done":
         await db.update_anime_genres(anime_id, selected)
         await state.clear()
-        await call.message.answer("✅ Janrlar yangilandi.", reply_markup=kb.admin_anime_detail_keyboard(anime_id))
+        seasons = await db.list_seasons(anime_id)
+        await call.message.answer(
+            "✅ Janrlar yangilandi.", reply_markup=kb.admin_anime_detail_keyboard(anime_id, bool(seasons))
+        )
         await call.answer()
         return
 
@@ -362,8 +369,9 @@ async def admin_delete_anime(call: CallbackQuery, db: Database):
 # ------------------------------------------------------------------ #
 @router.callback_query(F.data.startswith("adm:add_episode:"))
 async def add_episode_start(call: CallbackQuery, state: FSMContext):
+    """Anime sahifasidan to'g'ridan-to'g'ri qism qo'shish — FAQAT fasllarsiz (oddiy) animelar uchun."""
     anime_id = int(call.data.split(":")[2])
-    await state.update_data(episode_anime_id=anime_id, episode_videos=[])
+    await state.update_data(episode_anime_id=anime_id, episode_season_id=None, episode_videos=[])
     await state.set_state(AddEpisodeStates.waiting_video)
     await call.message.answer(
         "📼 Video(lar)ni birma-bir yuboring.\n\n"
@@ -395,49 +403,192 @@ async def add_episode_wrong_type(message: Message):
     )
 
 
+async def _return_after_episode_upload(
+    message: Message, db: Database, anime_id: int, season_id: Optional[int]
+) -> None:
+    """Video yuklash tugagach (Tayyor yoki Bekor qilish), admin qayerga qaytishini ko'rsatadi."""
+    if season_id:
+        season = await db.get_season(season_id)
+        anime = await db.get_anime(anime_id)
+        if season and anime:
+            count = await db.count_episodes_in_season(anime_id, season_id)
+            text = f"📁 <b>{anime['title']} — {season['season_number']}-fasl</b>\n📼 Qismlar: {count}"
+            await message.answer(text, reply_markup=kb.admin_season_detail_keyboard(season_id, anime_id))
+            return
+    anime = await db.get_anime(anime_id)
+    if anime:
+        seasons = await db.list_seasons(anime_id)
+        await message.answer(
+            f"🎬 <b>{anime['title']}</b>",
+            reply_markup=kb.admin_anime_detail_keyboard(anime_id, bool(seasons)),
+        )
+
+
+async def _notify_followers_new_episode(bot: Bot, db: Database, anime, episode) -> None:
+    """Animeni kuzatayotgan foydalanuvchilarga yangi qism haqida xabar beradi (bir marta, takrorsiz)."""
+    try:
+        followers = await db.list_followers(anime["id"])
+    except Exception:
+        logger.exception("Kuzatuvchilar ro'yxatini olishda xato")
+        return
+    if not followers:
+        return
+    text = f"🔔 <b>{anime['title']}</b> — yangi qism qo'shildi!\n🎬 {episode['episode_number']}-qism"
+    markup = kb.new_episode_notify_keyboard(episode["id"])
+    for f in followers:
+        try:
+            first_time = await db.try_mark_notified(f["user_pk"], episode["id"])
+        except Exception:
+            continue
+        if not first_time:
+            continue  # bu foydalanuvchiga shu qism haqida allaqachon xabar berilgan
+        try:
+            await bot.send_message(f["telegram_id"], text, reply_markup=markup)
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+
 @router.callback_query(AddEpisodeStates.waiting_video, F.data == "adm:episodes_done")
-async def add_episode_done(call: CallbackQuery, state: FSMContext, db: Database):
+async def add_episode_done(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot):
     data = await state.get_data()
     anime_id = data.get("episode_anime_id")
+    season_id = data.get("episode_season_id")
     videos: list[str] = data.get("episode_videos", [])
     await state.clear()
 
     if not videos:
         await call.answer("❗ Hech qanday video yuborilmadi.", show_alert=True)
         if anime_id:
-            anime = await db.get_anime(anime_id)
-            if anime:
-                await call.message.answer(
-                    f"🎬 <b>{anime['title']}</b>",
-                    reply_markup=kb.admin_anime_detail_keyboard(anime_id),
-                )
+            await _return_after_episode_upload(call.message, db, anime_id, season_id)
         return
 
     last_episode = None
     for file_id in videos:
-        last_episode = await db.add_episode(anime_id, file_id)
+        last_episode = await db.add_episode(anime_id, file_id, season_id)
 
     await call.message.answer(
         f"✅ {len(videos)} ta qism saqlandi "
-        f"(oxirgi qo'shilgani: {last_episode['episode_number']}-qism).",
-        reply_markup=kb.admin_anime_detail_keyboard(anime_id),
+        f"(oxirgi qo'shilgani: {last_episode['episode_number']}-qism)."
     )
+    await _return_after_episode_upload(call.message, db, anime_id, season_id)
     await call.answer()
+
+    anime = await db.get_anime(anime_id)
+    if anime and last_episode:
+        asyncio.create_task(_notify_followers_new_episode(bot, db, anime, last_episode))
 
 
 @router.callback_query(AddEpisodeStates.waiting_video, F.data == "adm:episodes_cancel")
 async def add_episode_cancel(call: CallbackQuery, state: FSMContext, db: Database):
     data = await state.get_data()
     anime_id = data.get("episode_anime_id")
+    season_id = data.get("episode_season_id")
     await state.clear()
     await call.answer("Bekor qilindi. Hech narsa saqlanmadi.", show_alert=True)
     if anime_id:
-        anime = await db.get_anime(anime_id)
-        if anime:
-            await call.message.answer(
-                f"🎬 <b>{anime['title']}</b>",
-                reply_markup=kb.admin_anime_detail_keyboard(anime_id),
-            )
+        await _return_after_episode_upload(call.message, db, anime_id, season_id)
+
+
+# ------------------------------------------------------------------ #
+# Fasllar (seasons) boshqaruvi
+# ------------------------------------------------------------------ #
+async def _open_seasons_admin(message: Message, db: Database, anime_id: int) -> None:
+    anime = await db.get_anime(anime_id)
+    if not anime:
+        return
+    seasons = await db.list_seasons(anime_id)
+    text = (
+        f"📚 <b>{anime['title']}</b> — fasllar:"
+        if seasons
+        else f"📚 <b>{anime['title']}</b> — hali fasl qo'shilmagan.\n\n➕ Yangi fasl qo'shish orqali boshlang."
+    )
+    await message.answer(text, reply_markup=kb.admin_seasons_keyboard(anime_id, seasons))
+
+
+@router.callback_query(F.data.startswith("adm:season_pick:"))
+async def season_pick_anime_list(call: CallbackQuery, db: Database):
+    page = int(call.data.split(":")[2])
+    rows = await db.all_anime_for_random()
+    rows = sorted(rows, key=lambda r: r["created_at"], reverse=True)
+    total_pages = max(1, math.ceil(len(rows) / PER_PAGE))
+    page_rows = rows[page * PER_PAGE: (page + 1) * PER_PAGE]
+    text = "📚 Qaysi animega fasl qo'shmoqchisiz?" if rows else "Hali anime qo'shilmagan."
+    markup = kb.admin_pick_anime_for_season_keyboard(page_rows, page, total_pages)
+    try:
+        await call.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=markup)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:season_pick_anime:"))
+async def season_pick_anime_selected(call: CallbackQuery, db: Database):
+    anime_id = int(call.data.split(":")[2])
+    anime = await db.get_anime(anime_id)
+    if not anime:
+        await call.answer("Topilmadi.", show_alert=True)
+        return
+    await _open_seasons_admin(call.message, db, anime_id)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:seasons_of:"))
+async def seasons_of_anime(call: CallbackQuery, db: Database):
+    anime_id = int(call.data.split(":")[2])
+    await _open_seasons_admin(call.message, db, anime_id)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:add_season:"))
+async def add_season(call: CallbackQuery, db: Database, state: FSMContext):
+    anime_id = int(call.data.split(":")[2])
+    # Agar bu animeda ilgari fasllarsiz qismlar bo'lsa — ularni xavfsiz "1-fasl"ga ko'chiradi
+    await db.ensure_season_migration(anime_id)
+    next_num = await db.next_season_number(anime_id)
+    season = await db.create_season(anime_id, next_num)
+    await state.update_data(episode_anime_id=anime_id, episode_season_id=season["id"], episode_videos=[])
+    await state.set_state(AddEpisodeStates.waiting_video)
+    await call.message.answer(
+        f"✅ {next_num}-fasl yaratildi.\n\n"
+        f"📼 Endi shu fasl uchun video(lar)ni birma-bir yuboring.\n\n"
+        f"✅ <b>Tayyor</b> — barcha yuborilgan videolarni qism sifatida saqlaydi.\n"
+        f"❌ <b>Bekor qilish</b> — hech narsa saqlamay chiqib ketadi.",
+        reply_markup=kb.episode_upload_keyboard(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:season:"))
+async def season_detail(call: CallbackQuery, db: Database):
+    season_id = int(call.data.split(":")[2])
+    season = await db.get_season(season_id)
+    if not season:
+        await call.answer("Topilmadi.", show_alert=True)
+        return
+    anime = await db.get_anime(season["anime_id"])
+    count = await db.count_episodes_in_season(season["anime_id"], season_id)
+    text = f"📁 <b>{anime['title']} — {season['season_number']}-fasl</b>\n📼 Qismlar: {count}"
+    await call.message.answer(text, reply_markup=kb.admin_season_detail_keyboard(season_id, season["anime_id"]))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:add_episode_season:"))
+async def add_episode_season_start(call: CallbackQuery, state: FSMContext, db: Database):
+    season_id = int(call.data.split(":")[2])
+    season = await db.get_season(season_id)
+    if not season:
+        await call.answer("Topilmadi.", show_alert=True)
+        return
+    await state.update_data(episode_anime_id=season["anime_id"], episode_season_id=season_id, episode_videos=[])
+    await state.set_state(AddEpisodeStates.waiting_video)
+    await call.message.answer(
+        f"📼 {season['season_number']}-fasl uchun video(lar)ni birma-bir yuboring.\n\n"
+        "✅ <b>Tayyor</b> — barcha yuborilgan videolarni qism sifatida saqlaydi.\n"
+        "❌ <b>Bekor qilish</b> — hech narsa saqlamay chiqib ketadi.",
+        reply_markup=kb.episode_upload_keyboard(),
+    )
+    await call.answer()
 
 
 # ------------------------------------------------------------------ #
